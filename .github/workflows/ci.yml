@@ -1,0 +1,165 @@
+name: CI
+
+# Pushes to main and pull requests. The release workflow runs the same jobs before it publishes
+# (workflow_call), with `artifacts: true` so the executables it releases are the ones tested here.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      artifacts:
+        description: Upload each executable and its build-info.json as a workflow artifact
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # github.workflow is the caller's name when the release workflow calls this one, so the two never share a group.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hygiene:
+    name: No traces, session data or credentials
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Check tracked files
+        shell: bash
+        run: |
+          status=0
+          fail() { echo "::error::$1"; printf '%s\n' "$2"; status=1; }
+
+          # Tracked files that .gitignore says must never be committed (auth.json, session databases, .env, captures/).
+          ignored=$(git ls-files --cached --ignored --exclude-standard)
+          [ -z "$ignored" ] || fail "tracked files match .gitignore:" "$ignored"
+
+          # Sign-in files, session databases, traces, logs and key files, by name.
+          names=$(git ls-files | grep -Ei '((^|/)auth(-pending)?\.json$|\.(db|sqlite|sqlite3|sqlite-wal|sqlite-shm)$|\.trace\.(jsonl|html)$|\.report\.html$|(^|/)rollout-.*\.jsonl$|(^|/)captures/|\.(pem|p12|key)$|(^|/)\.env(\..*)?$|(^|/)id_(rsa|ed25519|ecdsa)$|(^|/)\.npmrc$)' || true)
+          [ -z "$names" ] || fail "files that look like sign-in data, session data, traces or keys:" "$names"
+
+          # Credentials in content. Deliberately fake ones in tests are spelled with "synthetic" in them.
+          secrets=$(git grep -noIE 'sk-ant-[A-Za-z0-9_-]{20,}|sk-proj-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{40,}|(AKIA|ASIA)[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|xox[abposr]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{20,}' -- . ':!bun.lock' | grep -viE ':[^:]*synthetic[^:]*$' || true)
+          [ -z "$secrets" ] || fail "content that looks like a credential:" "$secrets"
+
+          # A private key as a key file has it: the BEGIN line on its own. Tests that exercise redaction put it inside a string.
+          keys=$(git grep -nIE '^\s*-----BEGIN [A-Z ]*PRIVATE KEY-----\s*$' -- . || true)
+          [ -z "$keys" ] || fail "content that looks like a private key:" "$keys"
+
+          # Real home directories. Examples and tests use these made-up users: me, u, user, someone.
+          homes=$(git grep -noIE '/home/[a-z][a-z0-9_.-]*/|/Users/[A-Za-z][A-Za-z0-9._-]*/' -- . ':!bun.lock' | grep -vE ':/(home|Users)/(me|u|user|someone)/$' || true)
+          [ -z "$homes" ] || fail "content with a home directory that is not one of the made-up users:" "$homes"
+
+          exit $status
+
+  typecheck:
+    name: Type-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/setup
+        with:
+          sandbox: "false"
+      - run: bun run typecheck
+
+  unit:
+    # Tests that start no process: in-process, quick, and run under a preload that fails any file that does start one
+    # (test/unit-preload.ts). They keep bun's 5 s limit per test, so that a hang shows at once.
+    name: Unit tests (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/setup
+        with:
+          sandbox: "false"
+      # No sign-in exists on the runner and none is given: nothing here may reach the model.
+      - run: bun run test:unit
+
+  e2e:
+    # Tests that start real processes (*.e2e.test.ts): git, shells, servers, tmux, the program itself. Each file sets a
+    # time limit sized for a slow runner. Split by file into three shards per runner, balanced by the durations in
+    # test/e2e-timings.json. No retries: a test that fails here is fixed, and the weekly stress run
+    # (.github/workflows/stress.yml) looks for the ones that fail only sometimes.
+    name: End-to-end ${{ matrix.shard }}/3 (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/setup
+      # The full-screen interface's end-to-end tests drive a terminal through tmux, which the Linux images have and macOS's has not.
+      - name: tmux
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: command -v tmux >/dev/null || brew install tmux
+      # No sign-in exists on the runner and none is given: nothing here may reach the model.
+      - run: bun run test:e2e --shard=${{ matrix.shard }}/3 --timings=test/e2e-timings.json
+
+  build:
+    # Each executable is built on its own platform, so the full-screen interface's native library is in it,
+    # and is run there before anything else uses it.
+    name: Build and run (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x64, runner: ubuntu-latest }
+          - { target: linux-arm64, runner: ubuntu-24.04-arm }
+          - { target: darwin-arm64, runner: macos-latest }
+          - { target: darwin-x64, runner: macos-15-intel }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/setup
+      - name: Build
+        run: bun scripts/build.ts --target ${{ matrix.target }}
+      - name: Run it
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          exe=dist/$(bun -e '
+            const info = await Bun.file("dist/build-info.json").json()
+            const [build] = info.builds
+            if (info.builds.length !== 1 || build.target !== process.env.TARGET) throw new Error(`expected one ${process.env.TARGET} build`)
+            if (!build.tui) throw new Error(`built without the full-screen interface: ${build.tuiMissing}`)
+            console.log(build.file)')
+          "$exe" --version
+          "$exe" --demo a-plain-answer --demo-speed 0
+          # Installed as the README says, from a release's files: the executable, with build-info.json beside it.
+          sh scripts/install.sh "$exe" --bin-dir "$RUNNER_TEMP/bin" --no-profile
+          for installed in "$RUNNER_TEMP"/bin/*; do "$installed" --version; done
+          # The README's checksum check works with this platform's shasum, and skips the files not downloaded.
+          cd dist
+          { shasum -a 256 "${exe#dist/}"; echo "0000000000000000000000000000000000000000000000000000000000000000  not-downloaded"; } > "$RUNNER_TEMP/SHA256SUMS"
+          cp "$RUNNER_TEMP/SHA256SUMS" . && shasum -a 256 -c --ignore-missing SHA256SUMS && rm SHA256SUMS
+      - name: Test it
+        run: bun test test/release/binary.e2e.test.ts
+      - name: Keep it
+        if: inputs.artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-${{ matrix.target }}
+          path: |
+            dist/*-${{ matrix.target }}
+            dist/build-info.json
+          if-no-files-found: error
+          retention-days: 7

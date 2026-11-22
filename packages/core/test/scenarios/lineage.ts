@@ -1,0 +1,609 @@
+/**
+ * Sessions that come from other sessions: a fork (its parent's history is
+ * its history), a replay (a recording, answered from the recording), and a
+ * subagent (a fresh conversation started by a tool call), together with the
+ * background work a session spawns beside its steps.
+ *
+ * A scenario is one session's log. A fork's log holds its parent's events
+ * first; a replay's and a subagent's start at seq 1 and name the session
+ * they come from (`ses_other`).
+ */
+import { event } from "../../src/event/durable.ts"
+import { REPLAY_TEXT } from "../../src/engine/replay.ts"
+import { SPAWN_TEXT, renderChildResult, renderCommandEnd, renderWatchFired, taskMessage } from "../../src/engine/spawn.ts"
+import { STOPPED_OUTPUT } from "../../src/replay/replay.ts"
+import {
+  OTHER,
+  type Scenario,
+  baseline,
+  called,
+  deliver,
+  enqueue,
+  executionStarted,
+  executionLeftToParent,
+  executionSucceeded,
+  forked,
+  opening,
+  replayCall,
+  replayCreated,
+  replayDiverged,
+  replayEnded,
+  say,
+  settled,
+  spawnEnded,
+  spawnStarted,
+  spawnedBy,
+  watchEnded,
+  watchFired,
+  watchStarted,
+  stepEnded,
+  stepStarted,
+  toolStarted,
+  toolStartedAs,
+  x,
+} from "./script.ts"
+
+// ---------------------------------------------------------------- fork
+
+export const forkContinues: Scenario = {
+  title: "A fork continues from its parent's history",
+  description:
+    "A session is forked at a step boundary. The fork is a session of its own (its own file, its own events from here on) whose history is the parent's up to the fork point: the first event of its own names the parent and the last inherited seq. It starts idle with an empty inbox, with the parent's baseline, settings and taint and the root session's cache key, so its first request is the parent's last request plus the new prompt. The parent is only read and may be working elsewhere meanwhile.",
+  provider: "the parent answers one prompt; the fork answers another",
+  phases: [
+    {
+      label: "the parent's step is open",
+      events: [...opening("What does add do?"), stepStarted("a1")],
+      expect: { open: "a1" },
+      rejects: [{ event: forked(6), code: "invalid_transition", why: "a fork point is a step boundary: the history up to it must be whole" }],
+    },
+    {
+      label: "the parent's turn ends",
+      events: [say("a1", "It adds two numbers."), stepEnded("a1"), executionSucceeded()],
+      expect: { execution: null, history: ["u1", "a1"] },
+      rejects: [{ event: forked(4), code: "invalid_range", why: "a fork is folded onto its parent at exactly the seq it names" }],
+    },
+    {
+      label: "the fork is created and takes a prompt of its own",
+      events: [forked(9), enqueue("u2", "And subtract?"), executionStarted("exe_2"), deliver("u2"), stepStarted("a2"), say("a2", "There is no subtract."), stepEnded("a2"), executionSucceeded("exe_2")],
+      expect: {
+        ui: [{ id: "u1" }, { id: "a1" }, { id: "u2", kind: "user" }, { id: "a2", status: "completed" }],
+        history: ["u1", "a1", "u2", "a2"],
+        execution: null,
+        inbox: [],
+      },
+    },
+  ],
+}
+
+// ---------------------------------------------------------------- replay
+
+const READ_A = '{"path":"a.test.ts"}'
+const EXPECTATION = "expect(add(1, 1)).toBe(3)"
+const LEFT = "left the recording at step 1, call 1: arguments differ"
+
+/** How every replay scenario begins: the replay session, its claim, the changed baseline, the recording's prompt delivered as it was. */
+const replayOpening = (policy: "stop" | "execute") => [replayCreated(policy, 14), executionStarted(), baseline(), enqueue("u1", "Fix the failing test."), deliver("u1")]
+
+export const replayIdentical: Scenario = {
+  title: "A replay that stays on its recording",
+  description:
+    "A recorded session (a read, then an answer) is replayed against a changed system prompt. The replay is a session of its own, typed as a replay of the recording. Its baseline is the recording's with the new prompt; the recording's prompt is delivered where it arrived. The model makes the recorded call: it is answered from the recording (`replay.call matched`, then the recorded `tool.started` and the recorded result, byte for byte) and nothing runs. No snapshot is taken, no check runs, nobody is asked. When the recording's last step is replayed the execution ends, and `replay.ended` says the replay was identical.",
+  provider: "as in the recording: step 1 calls read with the recorded arguments; step 2 answers",
+  phases: [
+    {
+      label: "the replay session starts with the changed baseline and the recorded prompt",
+      events: replayOpening("stop"),
+      expect: { history: ["u1"], execution: { status: "running", crashResumes: 0 } },
+      rejects: [{ event: replayDiverged("arguments_differ"), code: "invalid_transition", why: "under the stop policy a replay ends where it leaves the recording; it has no copy to carry on in" }],
+    },
+    {
+      label: "the model makes the recorded call and is given the recorded result",
+      events: [stepStarted("a1"), called("a1", "call_1", "read", READ_A)],
+      expect: { open: "a1" },
+      rejects: [
+        { event: replayCall("a1", "call_1", "matched"), code: "invalid_transition", why: "a matched call names the recorded call it matched" },
+        { event: replayCall("a1", "call_1", "diverged", { recorded: [0, 0], divergence: "arguments_differ" }), code: "invalid_transition", why: "only a matched call names a recorded call" },
+      ],
+    },
+    {
+      label: "the recording's answer follows, and the replay ends as identical",
+      events: [
+        toolStarted("a1", "call_1", "read"),
+        replayCall("a1", "call_1", "matched", { recorded: [0, 0] }),
+        settled("a1", "call_1", "success", EXPECTATION),
+        stepEnded("a1", "tool_calls"),
+        stepStarted("a2"),
+        say("a2", "The expectation is wrong."),
+        stepEnded("a2"),
+        executionSucceeded(),
+        replayEnded("identical", "all 2 recorded steps replayed without a divergence"),
+      ],
+      expect: { ui: [{ id: "u1" }, { id: "a1", calls: ["call_1 read success"] }, { id: "a2", status: "completed" }], history: ["u1", "a1", "a2"], execution: null },
+      rejects: [{ event: replayEnded("identical", "again"), code: "invalid_transition", why: "a replay ends once" }],
+    },
+  ],
+}
+
+export const replayStops: Scenario = {
+  title: "A replay that leaves its recording stops there",
+  description:
+    "Under the `stop` policy. The replayed model reads another file than the recording did. That call is not on the recording: it is recorded as the divergence (`replay.call diverged`, with the kind), it is not run, and it settles as not started with a text that says the replay stopped. The step closes, and the execution ends without an answer, marked as ended by the replay (`execution.failed` with `cause: replay`: nothing failed, but there is no answer to end on). `replay.ended` carries the report: where the replay left and what the recording did there.",
+  provider: "step 1 calls read with other arguments than the recording's",
+  phases: [
+    {
+      label: "the model calls read with other arguments",
+      events: [...replayOpening("stop"), stepStarted("a1"), called("a1", "call_1", "read", '{"path":"b.test.ts"}')],
+      expect: { open: "a1" },
+    },
+    {
+      label: "the call is not run, and the replay ends there",
+      events: [
+        replayCall("a1", "call_1", "diverged", { divergence: "arguments_differ" }),
+        settled("a1", "call_1", "not_started", STOPPED_OUTPUT),
+        stepEnded("a1", "tool_calls"),
+        event("execution.failed", { executionId: x("exe_1"), message: REPLAY_TEXT.ended(LEFT), cause: "replay" }),
+        replayEnded("diverged", LEFT),
+      ],
+      expect: { ui: [{ id: "u1" }, { id: "a1", calls: ["call_1 read not_started"] }], execution: null, open: null },
+    },
+  ],
+}
+
+export const replayExecutes: Scenario = {
+  title: "A replay that leaves its recording carries on in a copy",
+  description:
+    "Under the `execute` policy. At the first call that is not on the recording, the recorded workspace as it was at that point is restored into a copy (`replay.diverged`: the directory and the snapshot it was restored from; here the recording has none, so the copy starts empty), and from there the replay is an ordinary turn in that copy: the call runs for real (`replay.call diverged executed`), with the sandbox and without the network where the approval layer is on, and the turn runs to its answer. The recording's workspace is never touched. `replay.ended` says the replay diverged; what the copy holds can be graded.",
+  provider: "step 1 calls read with other arguments than the recording's; step 2 answers",
+  phases: [
+    {
+      label: "the model leaves the recording; the copy is made and the call runs in it",
+      events: [
+        ...replayOpening("execute"),
+        stepStarted("a1"),
+        called("a1", "call_1", "read", '{"path":"b.test.ts"}'),
+        replayDiverged("arguments_differ"),
+        toolStarted("a1", "call_1", "read"),
+        replayCall("a1", "call_1", "diverged", { divergence: "arguments_differ", executed: true }),
+        settled("a1", "call_1", "success", "expect(sub(2, 1)).toBe(1)"),
+        stepEnded("a1", "tool_calls"),
+      ],
+      expect: { open: null, execution: { status: "running", crashResumes: 0 } },
+      rejects: [{ event: replayDiverged("extra_call"), code: "invalid_transition", why: "a replay leaves its recording once" }],
+    },
+    {
+      label: "the turn runs to its answer in the copy",
+      events: [stepStarted("a2"), say("a2", "b.test.ts is fine."), stepEnded("a2"), executionSucceeded(), replayEnded("diverged", LEFT)],
+      expect: { ui: [{ id: "u1" }, { id: "a1", calls: ["call_1 read success"] }, { id: "a2", status: "completed" }], execution: null },
+    },
+  ],
+}
+
+// ---------------------------------------------------------------- subagents and background work
+
+const TASK = "Fix module a"
+const DELEGATE = '{"task":"Fix module a"}'
+const childAnswer = (steps: number, toolCalls: number) =>
+  renderChildResult(OTHER, { outcome: "completed", answer: "a.ts is fixed.", detail: "It finished.", steps, toolCalls, usage: null }, null, false)
+
+export const subagentReturns: Scenario = {
+  title: "A subagent runs a task and its answer is the call's result",
+  description:
+    "The model hands a task to a subagent. The call starts like any tool (its effect class says the step may change files); the child session is named in the parent's log (`spawn.started`) before it exists. The child runs its own loop in the same workspace with a fresh conversation. When it ends, `spawn.ended` records how, and what its model calls cost (rolled up into the parent's totals), and the call settles with the child's final answer and a reference to its session. Several such calls in one response run side by side. The subagent's turn is not verified; the parent's is.",
+  provider: "step 1 calls subagent; the child answers in one step; step 2 answers",
+  spawn: {},
+  phases: [
+    {
+      label: "the model asks for a subagent",
+      events: [...opening("Fix module a with a subagent."), stepStarted("a1"), called("a1", "call_1", "subagent", DELEGATE)],
+      expect: { open: "a1" },
+      rejects: [{ event: spawnStarted("bg_1", "a1", "call_1", "subagent"), code: "invalid_transition", why: "work is spawned by a tool call that is running: its start is durable first" }],
+    },
+    {
+      label: "the child is started and runs",
+      events: [toolStartedAs("a1", "call_1", "exec"), spawnStarted("bg_1", "a1", "call_1", "subagent")],
+      expect: { open: "a1" },
+      rejects: [
+        { event: spawnStarted("bg_1", "a1", "call_1", "subagent"), code: "duplicate_id", why: "a piece of spawned work starts once" },
+        { event: spawnEnded("bg_2", "completed", "It finished.", { steps: 1 }), code: "not_found", why: "only work that is running ends" },
+        { event: watchStarted("bg_1.w1", "bg_1", { pattern: "fixed" }), code: "invalid_transition", why: "only a background command's output is watched: a subagent's words are its own conversation" },
+      ],
+    },
+    {
+      label: "the child ends; its answer is the call's result",
+      events: [spawnEnded("bg_1", "completed", "It finished.", { steps: 1 }), settled("a1", "call_1", "success", childAnswer(1, 0)), stepEnded("a1", "tool_calls"), stepStarted("a2"), say("a2", "Module a is fixed."), stepEnded("a2")],
+      expect: { ui: [{ id: "u1" }, { id: "a1", calls: ["call_1 subagent success"] }, { id: "a2", status: "completed" }] },
+      rejects: [
+        { event: spawnEnded("bg_1", "completed", "It finished.", { steps: 1 }), code: "not_found", why: "spawned work ends once" },
+        { event: executionLeftToParent(), code: "invalid_transition", why: "only a subagent leaves the verification of its turn to the session that started it" },
+      ],
+    },
+    {
+      label: "the parent's turn ends through the gate",
+      events: [executionSucceeded()],
+      expect: { execution: null },
+    },
+  ],
+}
+
+export const subagentLog: Scenario = {
+  title: "The subagent's own log",
+  description:
+    "The same situation from the child's side. A subagent is a real session, typed as spawned by its parent: it starts at seq 1 with a fresh conversation (the baseline and its task; nothing of the parent's history), the parent's settings and working directory, and a cache key of its own. Its task is delivered like a prompt, with a note that says who reads its answer. It ends like any turn, but without running the verification gate: its `execution.succeeded` says `left_to_parent`, because the turn of the session that started it is what gets verified, once the child's work is in. That says nothing about whether the project has checks; the parent's ending does. At the depth limit (one level by default) its tool list has no `subagent`.",
+  provider: "the child answers in one step",
+  spawn: {},
+  phases: [
+    {
+      label: "the child is created with its task and works",
+      events: [spawnedBy(TASK), enqueue("u1", taskMessage(TASK)), executionStarted(), baseline(), deliver("u1"), stepStarted("a1"), say("a1", "a.ts is fixed."), stepEnded("a1")],
+      expect: { history: ["u1", "a1"] },
+      rejects: [{ event: executionSucceeded(), code: "invalid_transition", why: "a subagent's turn is not verified by itself: its ending cannot say that no check is configured, or anything else about checks" }],
+    },
+    {
+      label: "its turn ends, and the ending says who verifies it",
+      events: [executionLeftToParent()],
+      expect: { ui: [{ id: "u1", kind: "user" }, { id: "a1", status: "completed" }], history: ["u1", "a1"], execution: null },
+      rejects: [{ event: spawnEnded("bg_1", "completed", "It finished."), code: "not_found", why: "the end of the child's work is recorded in its parent's log, not its own" }],
+    },
+  ],
+}
+
+export const subagentInBackground: Scenario = {
+  title: "A background subagent's answer arrives as a message",
+  description:
+    "With `background: true` the call returns at once with the child's reference, and the model goes on. When the model has nothing more to do while the child still works, the turn does not end: the loop waits at the boundary (the checks would see the child's work half done). When the child ends, `spawn.ended` and the message that carries its answer are one append; the message is a harness message (`subagent_result`), delivered as a steer at the boundary, and the model answers it. Had the session been idle (its own turn failed, say), the message would have started a new execution.",
+  provider: "step 1 calls subagent with background; step 2 says it started; the child, which read a file meanwhile, answers; step 3 reports",
+  spawn: {},
+  phases: [
+    {
+      label: "the call returns at once and the model goes on",
+      events: [
+        ...opening("Fix module a in the background."),
+        stepStarted("a1"),
+        called("a1", "call_1", "subagent", '{"task":"Fix module a","background":true}'),
+        toolStartedAs("a1", "call_1", "exec"),
+        spawnStarted("bg_1", "a1", "call_1", "subagent", true),
+        settled("a1", "call_1", "success", SPAWN_TEXT.startedSubagent(OTHER)),
+        stepEnded("a1", "tool_calls"),
+        stepStarted("a2"),
+        say("a2", "Started."),
+        stepEnded("a2"),
+      ],
+      expect: { execution: { status: "running", crashResumes: 0 }, open: null, inbox: [] },
+    },
+    {
+      label: "the child ends: its answer is delivered, and the model reports",
+      events: [
+        spawnEnded("bg_1", "completed", "It finished.", { steps: 2 }),
+        enqueue("s1", childAnswer(2, 1), "steer", "subagent_result"),
+        deliver("s1"),
+        stepStarted("a3"),
+        say("a3", "The subagent fixed module a."),
+        stepEnded("a3"),
+        executionSucceeded(),
+      ],
+      expect: { ui: [{ id: "u1" }, { id: "a1" }, { id: "a2" }, { id: "s1", kind: "synthetic", origin: "subagent_result" }, { id: "a3", status: "completed" }], execution: null, inbox: [] },
+    },
+  ],
+}
+
+const TESTS = "bun test"
+const LOG = "/tmp/.spill/bg.log"
+const exited = renderCommandEnd("bg_1", { command: TESTS, exitCode: 0, signal: null, timedOut: false, stopped: null, durationMs: 2500, output: "3 pass\n", logPath: LOG })
+
+export const backgroundCommandWakes: Scenario = {
+  title: "A background command's exit wakes the idle session",
+  description:
+    "The shell tool's `background` argument starts a command and returns a handle at once. The command is spawned work of the session (`spawn.started`): it runs beside the steps, in the same sandbox a foreground command would, and is stopped when the session is interrupted or closed. The turn ends while it runs. When it exits, `spawn.ended` (with the exit code) and a harness message with the end of its output (`background_command`) are one append; the session is idle, so the message starts a new execution, is delivered, and the model answers.",
+  provider: "step 1 calls shell with background; step 2 answers; after the command exits, step 3 answers",
+  spawn: {},
+  phases: [
+    {
+      label: "the command is started in the background and the turn ends",
+      events: [
+        ...opening("Run the tests in the background."),
+        stepStarted("a1"),
+        called("a1", "call_1", "shell", '{"command":"bun test","background":true}'),
+        toolStarted("a1", "call_1", "shell"),
+        spawnStarted("bg_1", "a1", "call_1", { command: TESTS, logPath: LOG }, true),
+        settled("a1", "call_1", "success", "Started in the background as bg_1."),
+        stepEnded("a1", "tool_calls"),
+        stepStarted("a2"),
+        say("a2", "The tests are running."),
+        stepEnded("a2"),
+        executionSucceeded(),
+      ],
+      expect: { execution: null, inbox: [] },
+    },
+    {
+      label: "the command exits; the message wakes the session",
+      events: [
+        spawnEnded("bg_1", "completed", exited.split("\n")[0]!, { exitCode: 0 }),
+        enqueue("s1", exited, "steer", "background_command"),
+        executionStarted("exe_2"),
+        deliver("s1"),
+        stepStarted("a3"),
+        say("a3", "The tests pass."),
+        stepEnded("a3"),
+        executionSucceeded("exe_2"),
+      ],
+      expect: { ui: [{ id: "u1" }, { id: "a1" }, { id: "a2" }, { id: "s1", kind: "synthetic", origin: "background_command" }, { id: "a3" }], execution: null, inbox: [] },
+    },
+  ],
+}
+
+export const backgroundCommandLost: Scenario = {
+  title: "A background command is lost when the process dies",
+  description:
+    "A background command dies with the harness process: the guard that every command has kills its process group. The session's log still says it runs. When the session is opened again, the command is recorded as lost (`spawn.ended lost`) together with a harness message that says so (`spawn_lost`). Opening a session starts nothing, so the message waits in the inbox and is delivered, before the user's next prompt, when that prompt starts the next turn.",
+  provider: "step 1 calls shell with background; step 2 answers; the process dies; the user asks again; step 3 answers",
+  spawn: {},
+  phases: [
+    {
+      label: "the command runs in the background; the turn ends; the process dies",
+      events: [
+        ...opening("Watch the tests."),
+        stepStarted("a1"),
+        called("a1", "call_1", "shell", '{"command":"bun test --watch","background":true}'),
+        toolStarted("a1", "call_1", "shell"),
+        spawnStarted("bg_1", "a1", "call_1", { command: "bun test --watch", logPath: LOG }, true),
+        settled("a1", "call_1", "success", "Started in the background as bg_1."),
+        stepEnded("a1", "tool_calls"),
+        stepStarted("a2"),
+        say("a2", "Watching."),
+        stepEnded("a2"),
+        executionSucceeded(),
+      ],
+      expect: { execution: null },
+    },
+    {
+      label: "at the next start the command is recorded as lost; the model is told with the next prompt",
+      events: [
+        spawnEnded("bg_1", "lost", SPAWN_TEXT.commandLostDetail),
+        enqueue("s1", SPAWN_TEXT.commandLost("bg_1", "bun test --watch", LOG), "steer", "spawn_lost"),
+        enqueue("u2", "Still watching?"),
+        executionStarted("exe_2"),
+        deliver("s1"),
+        deliver("u2"),
+        stepStarted("a3"),
+        say("a3", "The watcher stopped when the harness restarted."),
+        stepEnded("a3"),
+        executionSucceeded("exe_2"),
+      ],
+      expect: { ui: [{ id: "u1" }, { id: "a1" }, { id: "a2" }, { id: "s1", kind: "synthetic", origin: "spawn_lost" }, { id: "u2", kind: "user" }, { id: "a3" }], execution: null, inbox: [] },
+    },
+  ],
+}
+
+// ---------------------------------------------------------------- watches on a background command's output
+
+const DEV = "bun run dev"
+const LISTENING = "Server listening on http://localhost:3000"
+/** The watch of the first scenario: the line that says the server is up, once. */
+export const UP_WATCH = { pattern: "listening on" } as const
+const up = { ...UP_WATCH, regex: false, ignoreCase: false }
+const serverUp = renderWatchFired("bg_1", { command: DEV, watch: up, firing: 1, limit: 1, line: LISTENING })
+const serverExited = renderCommandEnd("bg_1", { command: DEV, exitCode: 0, signal: null, timedOut: false, stopped: null, durationMs: 2500, output: `${LISTENING}\n`, logPath: LOG })
+
+/** The server is started in the background, and the turn ends while it runs. */
+const serverStarted = (prompt: string) => [
+  ...opening(prompt),
+  stepStarted("a1"),
+  called("a1", "call_1", "shell", '{"command":"bun run dev","background":true}'),
+  toolStarted("a1", "call_1", "shell"),
+  spawnStarted("bg_1", "a1", "call_1", { command: DEV, logPath: LOG }, true),
+  settled("a1", "call_1", "success", "Started in the background as bg_1."),
+  stepEnded("a1", "tool_calls"),
+  stepStarted("a2"),
+  say("a2", "The server is starting."),
+  stepEnded("a2"),
+  executionSucceeded(),
+]
+
+export const watchWakes: Scenario = {
+  title: "A watch on a background command's output wakes the idle session when a line matches",
+  description:
+    "A background command wakes the session when it exits; a server does not exit. The user, through their client, sets a watch on the running command's output: text a line must contain (or a regular expression), and how often it may fire (once by default, a bounded number at most). The watch is recorded (`watch.started`) and nothing else happens: the model is not told, and nothing starts. The model cannot ask for a watch itself: the tool list is fixed, and what a command prints must not be able to arrange for its own delivery. When the command prints a matching line, a harness message (`background_watch`) and `watch.fired` are one append: the message names the command and the watch and quotes the line inside a fence, labelled as output, which it is, not instructions; it is redacted like all command output. The message wakes the session exactly as a command's end does: the session is idle, so it starts a new execution, is delivered, and the model answers. The watch has fired as often as it may, so it is over, and the command ends later like any command.",
+  provider: "step 1 calls shell with background; step 2 answers; the user sets a watch; the server prints the line; step 3 answers; the server exits; step 4 answers",
+  spawn: {},
+  phases: [
+    {
+      label: "the server is started in the background and the turn ends",
+      events: serverStarted("Start the dev server."),
+      expect: { execution: null, inbox: [] },
+      rejects: [{ event: watchStarted("bg_2.w1", "bg_2", UP_WATCH), code: "not_found", why: "a watch is set on a command that is running" }],
+    },
+    {
+      label: "the user sets a watch for the line that says the server is up",
+      events: [watchStarted("bg_1.w1", "bg_1", UP_WATCH)],
+      expect: { execution: null, inbox: [], ui: [{ id: "u1" }, { id: "a1" }, { id: "a2" }] },
+      rejects: [
+        { event: watchStarted("bg_1.w1", "bg_1", { pattern: "error" }), code: "duplicate_id", why: "a watch is set once" },
+        { event: watchStarted("bg_1.w2", "bg_1", { pattern: "error", limit: 21 }), code: "invalid_transition", why: "a watch fires a bounded number of times" },
+        { event: watchFired("bg_1.w1", "bg_1", 1, LISTENING, "s1"), code: "not_found", why: "a firing is the message that tells the model: the message is admitted first, in the same append" },
+        { event: spawnEnded("bg_1", "completed", "It exited.", { exitCode: 0 }), code: "invalid_transition", why: "a command does not end while a watch on it could still fire: the watch is ended first, with the reason" },
+      ],
+    },
+    {
+      label: "the server prints the line; the message wakes the session",
+      events: [
+        enqueue("s1", serverUp, "steer", "background_watch"),
+        watchFired("bg_1.w1", "bg_1", 1, LISTENING, "s1"),
+        executionStarted("exe_2"),
+        deliver("s1"),
+        stepStarted("a3"),
+        say("a3", "The server is up on port 3000."),
+        stepEnded("a3"),
+        executionSucceeded("exe_2"),
+      ],
+      expect: { ui: [{ id: "u1" }, { id: "a1" }, { id: "a2" }, { id: "s1", kind: "synthetic", origin: "background_watch", text: serverUp }, { id: "a3" }], execution: null, inbox: [] },
+      rejects: [
+        { event: watchEnded("bg_1.w1", "bg_1", "removed"), code: "invalid_transition", why: "a watch that fired as often as it may is over: there is nothing left to remove" },
+        { event: watchStarted("bg_1.w1", "bg_1", UP_WATCH), code: "duplicate_id", why: "a watch that is over keeps its ID" },
+      ],
+    },
+    {
+      label: "the server exits later, like any background command",
+      events: [
+        spawnEnded("bg_1", "completed", serverExited.split("\n")[0]!, { exitCode: 0 }),
+        enqueue("s2", serverExited, "steer", "background_command"),
+        executionStarted("exe_3"),
+        deliver("s2"),
+        stepStarted("a4"),
+        say("a4", "The server has stopped."),
+        stepEnded("a4"),
+        executionSucceeded("exe_3"),
+      ],
+      expect: { execution: null, inbox: [] },
+      rejects: [{ event: watchStarted("bg_1.w2", "bg_1", UP_WATCH), code: "not_found", why: "a watch on a command that has ended is refused" }],
+    },
+  ],
+}
+
+const BUILD = "bun run build --watch"
+const TYPE_ERROR = "src/a.ts(3,7): error TS2322: Type 'string' is not assignable to type 'number'."
+/** The watch of the second scenario: any line that mentions an error, up to three times. */
+export const ERROR_WATCH = { pattern: "error|failed", regex: true, ignoreCase: true, limit: 3 } as const
+const buildFailed = renderWatchFired("bg_1", { command: BUILD, watch: ERROR_WATCH, firing: 1, limit: 3, line: TYPE_ERROR })
+const buildExited = renderCommandEnd("bg_1", { command: BUILD, exitCode: 1, signal: null, timedOut: false, stopped: null, durationMs: 2500, output: `${TYPE_ERROR}\n`, logPath: LOG, watches: [ERROR_WATCH] })
+
+export const watchFiresMidTurn: Scenario = {
+  title: "A watch fires while a turn runs, and ends with its command",
+  description:
+    "A watch can be set at any moment, also while the model works: it is the user's act, like sending a message. This one is a regular expression that ignores case and may fire three times. The command prints a matching line while a tool call of the turn runs. The message is admitted at once (one append with `watch.fired`) and, being a steer, is delivered at the next step boundary: the model reads it together with its tool's result and goes on. The watch has two firings left when the command exits. A watch is never silently gone: `watch.ended` records that it ended with its command, in the same append as `spawn.ended` and right before it, and the message about the command's end says so.",
+  provider: "step 1 calls shell with background (the user sets a watch); step 2 calls read, and the build prints an error meanwhile; step 3 answers; the build exits; step 4 answers",
+  spawn: {},
+  phases: [
+    {
+      label: "the build is started in the background; the user sets a watch while the turn runs",
+      events: [
+        ...opening("Run the build in watch mode and look at a.ts."),
+        stepStarted("a1"),
+        called("a1", "call_1", "shell", '{"command":"bun run build --watch","background":true}'),
+        toolStarted("a1", "call_1", "shell"),
+        spawnStarted("bg_1", "a1", "call_1", { command: BUILD, logPath: LOG }, true),
+        settled("a1", "call_1", "success", "Started in the background as bg_1."),
+        watchStarted("bg_1.w1", "bg_1", ERROR_WATCH),
+        stepEnded("a1", "tool_calls"),
+      ],
+      expect: { execution: { status: "running", crashResumes: 0 }, open: null, inbox: [] },
+    },
+    {
+      label: "the build prints an error while a file is read; the message is delivered at the next boundary",
+      events: [
+        stepStarted("a2"),
+        called("a2", "call_1", "read", '{"path":"src/a.ts"}'),
+        toolStarted("a2", "call_1", "read"),
+        enqueue("s1", buildFailed, "steer", "background_watch"),
+        watchFired("bg_1.w1", "bg_1", 1, TYPE_ERROR, "s1"),
+        settled("a2", "call_1", "success", "const a: number = '1'"),
+        stepEnded("a2", "tool_calls"),
+        deliver("s1"),
+        stepStarted("a3"),
+        say("a3", "The build reports the type error on line 3 of a.ts: the value is a string."),
+        stepEnded("a3"),
+        executionSucceeded(),
+      ],
+      expect: { execution: null, inbox: [], ui: [{ id: "u1" }, { id: "a1" }, { id: "a2" }, { id: "s1", origin: "background_watch" }, { id: "a3" }], history: ["u1", "a1", "a2", "s1", "a3"] },
+      rejects: [{ event: watchFired("bg_1.w1", "bg_1", 3, TYPE_ERROR, "s1"), code: "invalid_transition", why: "firings are counted one by one, up to the limit" }],
+    },
+    {
+      label: "the build exits: the watch that could still fire ends with it",
+      events: [
+        watchEnded("bg_1.w1", "bg_1", "command_ended"),
+        spawnEnded("bg_1", "completed", buildExited.split("\n")[0]!, { exitCode: 1 }),
+        enqueue("s2", buildExited, "steer", "background_command"),
+        executionStarted("exe_2"),
+        deliver("s2"),
+        stepStarted("a4"),
+        say("a4", "The build stopped with the type error still in place."),
+        stepEnded("a4"),
+        executionSucceeded("exe_2"),
+      ],
+      expect: { execution: null, inbox: [] },
+    },
+  ],
+}
+
+export const watchLost: Scenario = {
+  title: "A watch is lost with its command when the process dies",
+  description:
+    "A watch lives in the process that runs its command: the command dies with the harness (its guard kills the process group), and nothing follows its output any more. The log still says that the command runs and that a watch on it could fire. When the session is opened again, the watch is recorded as lost (`watch.ended lost`) right before its command is (`spawn.ended lost`), in one append with the harness message that tells the model that the command is gone and that the watch on it will not fire. So after a restart a watch is never just gone, and the model is not left waiting for a message that cannot come.",
+  provider: "step 1 calls shell with background; step 2 answers; the user sets a watch; the process dies; the user asks again; step 3 answers",
+  spawn: {},
+  phases: [
+    {
+      label: "the server runs in the background with a watch on its output; the process dies",
+      events: [...serverStarted("Start the dev server and tell me when it is up."), watchStarted("bg_1.w1", "bg_1", UP_WATCH)],
+      expect: { execution: null },
+    },
+    {
+      label: "at the next start the watch and its command are recorded as lost; the model is told with the next prompt",
+      events: [
+        watchEnded("bg_1.w1", "bg_1", "lost"),
+        spawnEnded("bg_1", "lost", SPAWN_TEXT.commandLostDetail),
+        enqueue("s1", SPAWN_TEXT.commandLost("bg_1", DEV, LOG, [up]), "steer", "spawn_lost"),
+        enqueue("u2", "Is it up?"),
+        executionStarted("exe_2"),
+        deliver("s1"),
+        deliver("u2"),
+        stepStarted("a3"),
+        say("a3", "The server stopped when the harness restarted, and so did the watch for its start. Shall I start it again?"),
+        stepEnded("a3"),
+        executionSucceeded("exe_2"),
+      ],
+      expect: { ui: [{ id: "u1" }, { id: "a1" }, { id: "a2" }, { id: "s1", kind: "synthetic", origin: "spawn_lost" }, { id: "u2", kind: "user" }, { id: "a3" }], execution: null, inbox: [] },
+      rejects: [{ event: watchEnded("bg_1.w1", "bg_1", "lost"), code: "not_found", why: "a watch ends once, and goes with its command" }],
+    },
+  ],
+}
+
+/** The watch of the fourth scenario: a regular expression that backtracks on a line that almost matches. */
+export const SLOW_WATCH = { pattern: "(a+)+$", regex: true, limit: 5 } as const
+/** Thirty characters the runtime's matcher needs about a second for with that expression. */
+export const SLOW_LINE = `${"a".repeat(29)}!`
+
+export const watchTooSlow: Scenario = {
+  title: "A watch whose regular expression is too slow on a line is ended",
+  description:
+    "The pattern of a watch is the user's and the line is whatever the command prints, and a regular expression can backtrack: `(a+)+$` against thirty characters that almost match takes the runtime's matcher about a second, during which nothing else in the process would run. The engine therefore gives a match a budget (`WATCH_LIMITS.matchMs`, 50 ms) and makes it on a helper thread. A match that has not answered by then is given up on, and its watch is ended with the reason on record (`watch.ended too_slow`): the expression is not tried on another line. The user is told in a notice that names the budget; the model is told nothing, as it was never told of the watch. The command goes on and ends like any other, with no watch left to end with it.",
+  provider: "step 1 calls shell with background; step 2 answers; the user sets a watch; the server prints a line the expression backtracks on; the server exits; step 3 answers",
+  spawn: {},
+  phases: [
+    {
+      label: "the server runs in the background and the user sets a watch with a regular expression",
+      events: [...serverStarted("Start the dev server."), watchStarted("bg_1.w1", "bg_1", SLOW_WATCH)],
+      expect: { execution: null, inbox: [] },
+    },
+    {
+      label: "the server prints a line the expression backtracks on: the match is given up on and the watch is ended",
+      events: [watchEnded("bg_1.w1", "bg_1", "too_slow")],
+      expect: { execution: null, inbox: [], ui: [{ id: "u1" }, { id: "a1" }, { id: "a2" }] },
+      rejects: [{ event: watchEnded("bg_1.w1", "bg_1", "removed"), code: "invalid_transition", why: "a watch that was ended is over: there is nothing left to remove" }],
+    },
+    {
+      label: "the server exits later, like any background command: no watch is left to end with it",
+      events: [
+        spawnEnded("bg_1", "completed", serverExited.split("\n")[0]!, { exitCode: 0 }),
+        enqueue("s1", serverExited, "steer", "background_command"),
+        executionStarted("exe_2"),
+        deliver("s1"),
+        stepStarted("a3"),
+        say("a3", "The server has stopped."),
+        stepEnded("a3"),
+        executionSucceeded("exe_2"),
+      ],
+      expect: { execution: null, inbox: [] },
+    },
+  ],
+}
+
+/**
+ * A fork's log spans two sessions' files: it begins with its parent's
+ * events. A scenario of it therefore cannot be stored as one session under
+ * another ID, which every other scenario can, so it is listed apart.
+ */
+export const forkScenarios = [forkContinues]
+
+export const lineageScenarios = [replayIdentical, replayStops, replayExecutes, subagentReturns, subagentLog, subagentInBackground, backgroundCommandWakes, backgroundCommandLost, watchWakes, watchFiresMidTurn, watchLost, watchTooSlow]
+

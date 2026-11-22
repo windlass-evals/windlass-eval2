@@ -1,0 +1,571 @@
+/**
+ * The projection: what a session looks like after folding its event log. The
+ * store keeps it in rows and updates it in the same transaction as each
+ * append; a test rebuilds it from the log and asserts equality.
+ *
+ * Every type here is declared as a validator, because projection rows are
+ * also read back from SQLite JSON.
+ */
+import { agentRefusal } from "../agents/restrictions.ts"
+import { agentRecord } from "../agents/use.ts"
+import { grant } from "../approval/grants.ts"
+import { choiceId, storedNeed, storedQuestion, storedRunDecision, storedTaintSource } from "../approval/record.ts"
+import { blobRef, content } from "../content.ts"
+import {
+  commandUse,
+  compactionMode,
+  delivery,
+  finishReason,
+  instructionFingerprint,
+  retiredResult,
+  lineage,
+  sessionSettings,
+  skippedFile,
+  snapshotId,
+  snapshotUnavailableReason,
+  stepError,
+  toolOutcome,
+  worktreeRecord,
+} from "../event/durable.ts"
+import { callId, executionId, messageId, sessionId } from "../id.ts"
+import { interruptReason } from "../interrupt.ts"
+import { providerError } from "../provider/error.ts"
+import { usage } from "../provider/usage.ts"
+import { type ToolEffect, toolEffect, toolSpec, truncation } from "../tool/tool.ts"
+import { verificationEvidence } from "../verify/evidence.ts"
+import { requiredCheckRefs } from "../verify/required.ts"
+import {
+  type Infer,
+  array,
+  boolean,
+  integer,
+  json,
+  literal,
+  nonEmptyString,
+  nullable,
+  object,
+  oneOf,
+  optional,
+  string,
+  variant,
+} from "../validate.ts"
+
+/**
+ * Why a message is left out of model history although it is still in the log.
+ * - `reverted`: the user rewound past it.
+ * - `refused`: it belongs to a step the provider refused.
+ */
+export const exclusion = oneOf(["reverted", "refused"])
+export type Exclusion = Infer<typeof exclusion>
+
+const base = {
+  id: messageId,
+  /** `seq` of the event that created the message. Messages are ordered by it. */
+  seq: integer(1),
+  /** Time of the event that created the message. */
+  time: integer(0),
+  excluded: nullable(exclusion),
+}
+
+/**
+ * The tool-call state machine. A call is created `pending` by `tool.called`,
+ * may become `running` by `tool.started`, and ends `settled` exactly once.
+ *
+ *   pending --tool.started--> running
+ *   pending --tool.settled--> settled   (outcome: not_started | error)
+ *   running --tool.settled--> settled   (outcome: success | error | effect_unknown)
+ *
+ * While it runs, the user may ask once for this call alone to stop
+ * (`tool.cancel_requested`, recorded on the call as `cancel`). That changes
+ * nothing about how it settles: a running call settles as above.
+ *
+ * A running call carries the effect class it started with. A `read` call has
+ * no side effect, so it cannot settle as `effect_unknown`.
+ *
+ * A step cannot end while any of its calls is not settled.
+ */
+export const toolCallState = variant("status", {
+  pending: object({ status: literal("pending") }),
+  running: object({ status: literal("running"), effect: toolEffect }),
+  settled: object({
+    status: literal("settled"),
+    outcome: toolOutcome,
+    /** The text for the model, exactly as it is sent. */
+    output: string,
+    truncation: nullable(truncation),
+    attachments: array(blobRef),
+    display: nullable(json),
+  }),
+})
+export type ToolCallState = Infer<typeof toolCallState>
+
+/** The outcomes `tool.settled` may record from each unsettled state. */
+export const SETTLE_FROM = {
+  pending: ["not_started", "error"],
+  running: ["success", "error", "effect_unknown"],
+} as const satisfies Record<"pending" | "running", readonly Infer<typeof toolOutcome>[]>
+
+/** The outcomes `tool.settled` may record for a call in `state`. Empty once it is settled. */
+export function settleOutcomes(state: ToolCallState): readonly Infer<typeof toolOutcome>[] {
+  if (state.status === "settled") return []
+  if (state.status === "pending") return SETTLE_FROM.pending
+  return SETTLE_FROM.running.filter((outcome) => outcome !== "effect_unknown" || hasSideEffect(state.effect))
+}
+
+/** Whether a started call of this effect class may have changed something. */
+export function hasSideEffect(effect: ToolEffect): boolean {
+  return effect !== "read"
+}
+
+/**
+ * A watch on the output of a background command (`watch.started`). It is in
+ * force while it has not ended and has not fired `limit` times (`watchInForce`).
+ */
+export const outputWatch = object({
+  watchId: nonEmptyString,
+  seq: integer(1),
+  pattern: nonEmptyString,
+  regex: boolean,
+  ignoreCase: boolean,
+  limit: integer(1),
+  fired: integer(0),
+  ended: nullable(oneOf(["removed", "command_ended", "lost", "too_slow"])),
+})
+export type OutputWatch = Infer<typeof outputWatch>
+
+/** Whether a watch can still fire. */
+export function watchInForce(watch: OutputWatch): boolean {
+  return watch.ended === null && watch.fired < watch.limit
+}
+
+/**
+ * What the approval layer did with a call that did not simply run.
+ * - `asked`: the user was asked (`approval.requested`); `answer` is `null`
+ *   while the question is pending, then what they chose. The call starts only
+ *   after an approving answer.
+ * - `denied`: refused without a question, by the policy or because nobody was
+ *   present to answer.
+ */
+export const callApproval = variant("kind", {
+  asked: object({
+    kind: literal("asked"),
+    seq: integer(1),
+    question: storedQuestion,
+    needs: array(storedNeed),
+    then: storedRunDecision,
+    answer: nullable(object({ seq: integer(1), choice: choiceId, approve: boolean, note: nullable(string) })),
+  }),
+  /** `agent`: the agent whose restrictions refused the call, when it was those and not the approval policy; `refusal` is then which rule, the call's effect class and a sentence for the user. */
+  denied: object({ kind: literal("denied"), seq: integer(1), reason: oneOf(["policy", "unattended"]), stop: boolean, agent: optional(nonEmptyString), refusal: optional(agentRefusal) }),
+})
+export type CallApproval = Infer<typeof callApproval>
+
+/** One piece of an assistant message, in the order the model produced it. */
+export const assistantPart = variant("type", {
+  text: object({ type: literal("text"), text: string, providerData: nullable(json) }),
+  reasoning: object({ type: literal("reasoning"), text: string, providerData: nullable(json) }),
+  tool_call: object({
+    type: literal("tool_call"),
+    callId,
+    name: nonEmptyString,
+    /** The argument text exactly as the model produced it. */
+    input: string,
+    providerData: nullable(json),
+    state: toolCallState,
+    /** Set when the call was asked about or denied; absent for a call that simply ran. */
+    approval: optional(callApproval),
+    /** Set when the user asked for this one call to stop while it ran (`tool.cancel_requested`): where in the log. Its result says what came of it. */
+    cancel: optional(object({ seq: integer(1) })),
+    /** Set for a call a program made: the program's call (`run_code`) it is nested under. The model never sees it; it sees the program's result. */
+    parent: optional(callId),
+  }),
+})
+export type AssistantPart = Infer<typeof assistantPart>
+export type ToolCallPart = Extract<AssistantPart, { type: "tool_call" }>
+
+export const message = variant("kind", {
+  /** Something the user said, delivered from the inbox. */
+  user: object({
+    kind: literal("user"),
+    ...base,
+    content,
+    delivery,
+    /** The slash command that produced `content`, when one did (`command.expanded`): what a transcript shows the message as. */
+    command: optional(commandUse),
+    titlePrompt: optional(string),
+  }),
+  /**
+   * Something the harness said to the model. `delivery` is `null` when it was
+   * appended directly rather than delivered from the inbox.
+   */
+  synthetic: object({ kind: literal("synthetic"), ...base, origin: nonEmptyString, content, delivery: nullable(delivery) }),
+  /**
+   * An instruction appended after the baseline, with its text frozen.
+   * `fingerprint` identifies the value it gives the model for `source`, or is
+   * `null` when it says the source is gone.
+   */
+  instruction: object({
+    kind: literal("instruction"),
+    ...base,
+    source: nonEmptyString,
+    text: string,
+    fingerprint: nullable(nonEmptyString),
+  }),
+  /** The output of one step attempt. */
+  assistant: object({
+    kind: literal("assistant"),
+    ...base,
+    model: nonEmptyString,
+    /** The latest attempt of the step's retry budget that ran under this message. */
+    attempt: integer(1),
+    /**
+     * `running` until the step's single terminal event. `refused` messages are
+     * always excluded from model history.
+     */
+    status: oneOf(["running", "completed", "failed", "refused"]),
+    parts: array(assistantPart),
+    finish: nullable(finishReason),
+    usage: nullable(usage),
+    /** Set when `status` is `failed`. */
+    error: nullable(stepError),
+    /** The refusal text, set when `status` is `refused`. */
+    refusal: nullable(string),
+    /**
+     * The most recent retry scheduled for this message, kept for display. While
+     * the message is `running`, `attempt` already equals this retry's attempt.
+     */
+    lastRetry: nullable(object({ attempt: integer(2), delayMs: integer(0), error: providerError, time: integer(0) })),
+    /** Time of the terminal event. */
+    endedAt: nullable(integer(0)),
+  }),
+  /**
+   * A compaction and, once completed, its checkpoint text. Never excluded by
+   * itself; a revert or a refusal whose range holds it excludes it, and it
+   * then no longer applies.
+   */
+  compaction: object({
+    kind: literal("compaction"),
+    ...base,
+    trigger: oneOf(["auto", "manual", "overflow"]),
+    mode: compactionMode,
+    status: oneOf(["running", "completed", "failed"]),
+    /** The cut: the first `seq` kept verbatim after the checkpoint. Decided before the summary is asked for. */
+    keepFromSeq: integer(1),
+    /** The prompt of the summary request, frozen. */
+    prompt: string,
+    /** The one repair of the summary: the rejected answer and the follow-up prompt, and the ledger attempt that first carries them. */
+    repair: nullable(object({ attempt: integer(2), answer: string, prompt: string })),
+    /** The checkpoint text for the model, set when `status` is `completed`. */
+    summary: nullable(string),
+    /** Where the checkpoint's summary came from, set when `status` is `completed`. */
+    source: nullable(oneOf(["model", "repaired", "fallback"])),
+    /** Why it is a fallback, or what is still wrong with the summary that was used. */
+    detail: nullable(string),
+    /** The estimated size of the next request when the compaction was decided, and with its checkpoint in place. */
+    tokensBefore: integer(0),
+    tokensAfter: nullable(integer(0)),
+    usage: nullable(usage),
+    error: nullable(stepError),
+    endedAt: nullable(integer(0)),
+    /**
+     * The kept tool results whose images are no longer sent while this
+     * compaction is in force (`compaction.ended.retired`); absent when there
+     * are none. The request builder renders them from this.
+     */
+    retired: optional(array(retiredResult)),
+  }),
+})
+export type Message = Infer<typeof message>
+export type MessageKind = Message["kind"]
+export type UserMessage = Extract<Message, { kind: "user" }>
+export type SyntheticMessage = Extract<Message, { kind: "synthetic" }>
+export type InstructionMessage = Extract<Message, { kind: "instruction" }>
+export type AssistantMessage = Extract<Message, { kind: "assistant" }>
+export type CompactionMessage = Extract<Message, { kind: "compaction" }>
+
+/** An admitted input that has not been delivered yet. The inbox holds only these. */
+export const inboxItem = object({
+  /** The ID the message will have once delivered. */
+  messageId,
+  /** `seq` of the enqueue event. Items of equal delivery mode are delivered in this order. */
+  seq: integer(1),
+  time: integer(0),
+  /** `null` for user input; otherwise the harness component that produced it. */
+  origin: nullable(nonEmptyString),
+  delivery,
+  content,
+  /** A bounded excerpt taken before attachments or command files were expanded. */
+  titlePrompt: optional(string),
+  /** The slash command that produced `content`, when one did (`command.expanded`). */
+  command: optional(commandUse),
+  /** The agent that command names, as its definition was when the command was sent: the session switches to it where this item is delivered, right before it. */
+  agent: optional(agentRecord),
+})
+export type InboxItem = Infer<typeof inboxItem>
+
+/**
+ * The frozen request prefix in force, and the `seq` of the event that set it.
+ * `sources` is what the model was given per instruction source in
+ * `instructions`; later `instruction` messages supersede it source by source.
+ */
+export const baseline = object({
+  seq: integer(1),
+  instructions: string,
+  tools: array(toolSpec),
+  sources: array(instructionFingerprint),
+})
+export type Baseline = Infer<typeof baseline>
+
+/**
+ * What has started and not yet reached its terminal event. While something
+ * is open the session is not at a boundary: no message enters history, no
+ * execution starts or ends, the settings do not change.
+ * - `step` / `compaction`: a model call, under assistant or compaction message `messageId`.
+ * - `checks`: run `run` of the configured checks.
+ * - `revert` / `undo`: a restore of the workspace announced by
+ *   `revert.started` / `revert.undo_started`, with the fields recovery needs
+ *   to finish it. The only kinds that are open while the session is idle.
+ * - `handover`: a turn ended (`turn.ended`) because queued item `messageId`
+ *   waits. Only that item's delivery closes it, in the same append.
+ */
+export const openWork = variant("kind", {
+  step: object({ kind: literal("step"), messageId }),
+  compaction: object({ kind: literal("compaction"), messageId }),
+  checks: object({ kind: literal("checks"), run: integer(1), seq: integer(1) }),
+  revert: object({ kind: literal("revert"), fromSeq: integer(1), target: snapshotId, before: snapshotId, keep: array(string) }),
+  undo: object({ kind: literal("undo"), revertSeq: integer(1), target: snapshotId, before: snapshotId, keep: array(string) }),
+  handover: object({ kind: literal("handover"), messageId }),
+})
+export type OpenWork = Infer<typeof openWork>
+
+/** What is open, for a message: `step a1`, `checks run 2`, `a revert`. */
+export function describeOpen(open: OpenWork): string {
+  switch (open.kind) {
+    case "step":
+    case "compaction":
+      return `${open.kind} ${open.messageId}`
+    case "checks":
+      return `checks run ${open.run}`
+    case "revert":
+      return `the revert to before seq ${open.fromSeq}`
+    case "undo":
+      return `the undo of the revert at seq ${open.revertSeq}`
+    case "handover":
+      return `the delivery of queued item ${open.messageId}`
+  }
+}
+
+export const sessionState = object({
+  id: sessionId,
+  cwd: nonEmptyString,
+  title: nullable(string),
+  titleGenerated: optional(boolean),
+  lineage: nullable(lineage),
+  /**
+   * The first session of the fork chain this session belongs to: its own ID
+   * for a root session (a subagent and a replay are roots: their
+   * conversations are their own), the parent's `rootId` for a fork. Requests use it as
+   * the prompt-cache key, so a fork's first request is its parent's request
+   * at the fork point and reads the same cached prefix.
+   */
+  rootId: sessionId,
+  archived: boolean,
+  createdAt: integer(0),
+  /**
+   * The model and reasoning effort in force: the request builder takes the
+   * `params` of the next request from here, never from its caller.
+   */
+  settings: sessionSettings,
+  /**
+   * The crash-recovery claim. `null` when idle. `running` while a process
+   * works on the session (after a crash it stays `running` until recovery).
+   * `suspended` after a shutdown interruption: the claim is kept for the next start.
+   */
+  execution: nullable(
+    object({
+      id: executionId,
+      status: oneOf(["running", "suspended"]),
+      /**
+       * How many times recovery took this execution up again after a crash.
+       * A resume after a clean shutdown is not counted, so a long turn that
+       * spans several restarts never reaches the crash-resume cap by itself.
+       */
+      crashResumes: integer(0),
+      startedSeq: integer(1),
+      /**
+       * The `attempt` the next `step.started` must carry. 1, except after a
+       * failed message was given a retry: then it is that retry's attempt, so
+       * the new message continues the logical step's one attempt budget.
+       */
+      nextAttempt: integer(1),
+      /**
+       * Set by `execution.interrupt_requested` and cleared by the
+       * `execution.interrupted` that completes it. While it is set the
+       * execution only winds down, and it can end only as interrupted for
+       * this reason, also when recovery finds it after a crash.
+       */
+      interrupting: nullable(interruptReason),
+    }),
+  ),
+  /** The step, compaction, check run or restore that has started and not yet reached its terminal event. */
+  open: nullable(openWork),
+  /** The latest completed compaction that is not excluded. Model history starts from it. */
+  compaction: nullable(object({ messageId, seq: integer(1), keepFromSeq: integer(1) })),
+  /**
+   * What the log says about the working tree.
+   * - `snapshot`: the latest recorded snapshot and the `seq` of its event;
+   *   `null` before the first one and while snapshots are unavailable.
+   * - `unavailable`: why no snapshot can be taken right now, else `null`.
+   * - `skipped`, `nestedRepositories`: what snapshots currently leave out.
+   */
+  workspace: object({
+    snapshot: nullable(object({ id: snapshotId, seq: integer(1) })),
+    unavailable: nullable(object({ reason: snapshotUnavailableReason, message: string })),
+    skipped: array(skippedFile),
+    nestedRepositories: array(string),
+  }),
+  /**
+   * What the verification gate decides from.
+   * - `verified`: the workspace state checks are selected against: the
+   *   session's first snapshot, then the state at each verification that
+   *   passed or found nothing to check. `snapshot` is `null` when none could
+   *   be taken; `seq` is where in the log that was. Once a record has moved
+   *   it on from the first snapshot, `run` is the run of checks that last
+   *   passed on the way to it (the `seq` of its `checks.finished` and its
+   *   number in its turn; `null` when none has), and `requiredChecks` is
+   *   the required checks that stand on it (`verify/required.ts`), as the
+   *   record that moved it named them. Both are absent at the first
+   *   snapshot, which every check stands on, and where a record written
+   *   before they were kept moved it; `requiredChecks` also where none
+   *   stands.
+   * - `latest`: the most recent run of checks that produced results, with the
+   *   snapshot taken right after it (so files a check itself wrote do not
+   *   count as a change by the model).
+   */
+  verification: object({
+    verified: nullable(
+      object({
+        seq: integer(1),
+        snapshot: nullable(snapshotId),
+        run: optional(nullable(object({ seq: integer(1), run: integer(1) }))),
+        requiredChecks: optional(requiredCheckRefs),
+      }),
+    ),
+    latest: nullable(object({ run: integer(1), seq: integer(1), snapshot: nullable(snapshotId), evidence: verificationEvidence })),
+  }),
+  /**
+   * The reverts that can still be undone, oldest first: each with the `seq`
+   * of its `history.reverted`, its range, the snapshots to restore and to
+   * compare against (`null` when it restored no file), and the `seq` of every
+   * message it excluded. Undoing pops the last one. Emptied when an execution
+   * starts: new work on top of a revert makes it final.
+   */
+  reverts: array(
+    object({
+      seq: integer(1),
+      fromSeq: integer(1),
+      before: nullable(snapshotId),
+      after: nullable(snapshotId),
+      excluded: array(integer(1)),
+    }),
+  ),
+  /**
+   * What the approval layer keeps for the session; absent until it records
+   * something.
+   * - `grants`: the approvals remembered for this session, oldest first, each
+   *   with the `seq` of the answer that created it. Never reverted: an
+   *   approval the user gave stays given. A fork starts with none.
+   * - `taint`: set by `taint.noticed` (where, from what, and the sentence the
+   *   user was shown) and cleared by `taint.cleared`. It is what a client
+   *   shows; the decisions derive taint from the log itself. A fork inherits it.
+   */
+  approval: optional(
+    object({
+      grants: array(grant),
+      taint: nullable(object({ seq: integer(1), source: storedTaintSource, text: string })),
+    }),
+  ),
+  /**
+   * What the session spawned; absent until it spawns something.
+   * - `running`: the subagents and background commands that have not ended,
+   *   oldest first, each as `spawn.started` recorded it. A session that is
+   *   opened with entries here that nobody is running lost them to a restart.
+   * - `children`: every child session this session ever started, oldest
+   *   first: the ones a follow-up message can be sent to.
+   * - `usage`: what the children's model calls cost so far, added up from
+   *   each `spawn.ended`. Not part of this session's own requests.
+   */
+  spawned: optional(
+    object({
+      running: array(
+        object({
+          spawnId: nonEmptyString,
+          seq: integer(1),
+          kind: oneOf(["command", "subagent"]),
+          background: boolean,
+          messageId,
+          callId,
+          /** The child session, for a subagent. */
+          sessionId: nullable(sessionId),
+          /** The command line and where its output is written, for a command. */
+          command: nullable(string),
+          logPath: nullable(string),
+          worktree: nullable(worktreeRecord),
+          /**
+           * The watches the user set on a command's output, oldest first, each as `watch.started` recorded it:
+           * how often it fired, and why it ended when it ended without using up its limit. Absent until one is set.
+           * They go with the entry when the command ends.
+           */
+          watches: optional(array(outputWatch)),
+        }),
+      ),
+      children: array(sessionId),
+      usage: nullable(usage),
+    }),
+  ),
+  /**
+   * The agent the session runs as (`agent.switched`): the definition as it
+   * was when it was selected, with the restrictions every call is checked
+   * against. `null` after it was switched off; absent for a session that
+   * never ran as one. A fork inherits it with the history.
+   */
+  agent: optional(nullable(agentRecord)),
+  /**
+   * Set for a replay session: the copy of the workspace it carries on in once
+   * it left the recording (`replay.diverged`), and how it ended.
+   */
+  replay: optional(
+    object({
+      workspace: nullable(string),
+      ended: nullable(object({ seq: integer(1), outcome: oneOf(["identical", "diverged", "unsupported", "incomplete"]), reason: string })),
+    }),
+  ),
+})
+
+/** The workspace, verification and undo state of a session nothing has happened in yet. */
+export const INITIAL_TRACKING = {
+  workspace: { snapshot: null, unavailable: null, skipped: [], nestedRepositories: [] },
+  verification: { verified: null, latest: null },
+  reverts: [],
+} as const satisfies Pick<Infer<typeof sessionState>, "workspace" | "verification" | "reverts">
+export type SessionState = Infer<typeof sessionState>
+
+/**
+ * The whole projected state of one session.
+ *
+ * `reduce` shares structure: any part an event did not touch is the same
+ * object as before. `session` changes only on session, execution, step-open
+ * and compaction events, so the store can skip rewriting it on most appends.
+ */
+export interface Projection {
+  /** `seq` of the last folded event. */
+  readonly lastSeq: number
+  /** Time of the last folded event. */
+  readonly updatedAt: number
+  readonly session: SessionState
+  readonly baseline: Baseline | null
+  /** Every message, including excluded and pre-compaction ones, ordered by `seq`. */
+  readonly messages: readonly Message[]
+  /** Undelivered inbox items, ordered by `seq`. */
+  readonly inbox: readonly InboxItem[]
+}

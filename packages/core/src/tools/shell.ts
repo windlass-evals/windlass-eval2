@@ -1,0 +1,596 @@
+/**
+ * shell: runs a command in its own process group. stdout and stderr are read
+ * as they arrive, written to a spill file (up to a size limit) and kept in
+ * memory only as a bounded head and tail, so a command that prints gigabytes
+ * cannot exhaust memory. The tool caps its own output and sets `truncation`,
+ * so the runtime never caps it again.
+ *
+ * Stopping (an interrupt, the user stopping this one call, a timeout, or
+ * leftovers after the command exits): SIGTERM to
+ * the whole group, wait up to the grace period for the group to empty, then
+ * SIGKILL the group. Background processes the command started are stopped the
+ * same way when it finishes. If this process dies while a command runs, a
+ * guard process kills the command's group (`guardGroup`).
+ */
+import { mkdir, unlink } from "node:fs/promises"
+import { join } from "node:path"
+import { escalationSchema } from "../approval/escalation.ts"
+import { callStopReasonOf } from "../interrupt.ts"
+import type { CommandSandbox } from "../sandbox/command.ts"
+import { OUTPUT_LIMITS, type OutputLimits, fitsLimits, renderCapped } from "../tool/cap.ts"
+import { redactingStream } from "../tool/redact-stream.ts"
+import type { Tool, ToolContext, ToolResult } from "../tool/tool.ts"
+import type { ToolOptions } from "./common.ts"
+
+export interface ShellInput {
+  readonly command: string
+  readonly timeout?: number
+  /**
+   * The model's explicit request for more access than the sandbox gives. The
+   * tool does not act on it: the step loop decides from it (and asks the
+   * user), and tells the tool how to run through `ToolContext.sandbox`.
+   */
+  readonly sandbox?: { readonly network?: boolean; readonly write?: readonly string[] }
+  /**
+   * Start the command and return at once with a handle. It keeps running
+   * beside the session's steps; its exit is delivered as a message.
+   */
+  readonly background?: boolean
+}
+
+export interface ShellOptions extends ToolOptions {
+  /** The shell to run `-c` with. Default: `bash` from PATH, else `/bin/sh`. */
+  readonly shell?: string
+  /** Time between SIGTERM and SIGKILL. Default 3000 ms. */
+  readonly graceMs?: number
+  /** The spill file stops growing at this size; the head and tail in memory still see everything. Default 1 GiB. */
+  readonly spillLimitBytes?: number
+  /**
+   * Wraps a command the step loop decided to run sandboxed. Without it such
+   * a command is refused: the tool never runs unsandboxed what it was told
+   * to sandbox. It also says what of the environment a command of a session
+   * that runs without the sandbox is not given (`CommandSandbox.environment`).
+   */
+  readonly sandbox?: CommandSandbox
+  /**
+   * The environment of a command that runs without the sandbox, for a caller
+   * that knows it. Default: what `sandbox` says for the session, and without
+   * that the harness's own.
+   */
+  readonly env?: Readonly<Record<string, string | undefined>>
+}
+
+export const DEFAULT_TIMEOUT_SECONDS = 120
+const MAX_TIMEOUT_SECONDS = 3600
+/** Each is more than half the byte limit, which is what `renderCapped` needs from a streaming source. */
+const HEAD_KEEP = 64 * 1024
+const TAIL_KEEP = 64 * 1024
+/** How much of one line a listener of `lines` is given: a longer line is cut there. */
+const LINE_KEEP = 16 * 1024
+const PROGRESS_INTERVAL_MS = 200
+const PROGRESS_LINES = 20
+/** How long to wait for the pipes to close after the process group is gone (a process that left the group may hold them). */
+const DRAIN_MS = 1000
+/** The output keeps room for the status line, so the whole result stays within the runtime's limits. */
+const BODY_LIMITS: OutputLimits = { maxBytes: OUTPUT_LIMITS.maxBytes - 1024, maxLines: OUTPUT_LIMITS.maxLines - 6 }
+
+type StopReason = "timeout" | "user" | "shutdown" | "call"
+
+export function shellTool(options: ShellOptions): Tool<ShellInput> {
+  const shell = options.shell ?? Bun.which("bash") ?? "/bin/sh"
+  const graceMs = options.graceMs ?? 3000
+  const spillLimit = options.spillLimitBytes ?? 1024 * 1024 * 1024
+  return {
+    name: "shell",
+    description:
+      "Run a shell command in the working directory and return its combined stdout and stderr. stdin is empty. The command is stopped after `timeout` seconds (default 120). Background processes it starts are stopped when it finishes. Long output keeps its beginning and end, and the full output is saved to a file whose path is given. Commands normally run in a sandbox: no network, and writes only inside the working directory and the temp directory ($TMPDIR, which is /tmp on Linux; it is private to this session and the file tools see the same files there). When a command needs more, pass `sandbox`. With `background` the command is started and the call returns at once with a handle: use it for something slow (a long test run, a build, a server) while you do other work. You get a message when it exits, `background_output` shows its output so far and `background_stop` stops it; it has no time limit unless you pass `timeout`, and it is stopped when the session is interrupted or closed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        command: { type: "string", minLength: 1, description: "The command line, run with `-c`." },
+        timeout: { type: "integer", minimum: 1, maximum: MAX_TIMEOUT_SECONDS, description: "Seconds before the command is stopped. Default 120." },
+        sandbox: escalationSchema,
+        background: { type: "boolean", description: "Start it in the background and return a handle at once." },
+      },
+      required: ["command"],
+      additionalProperties: false,
+    },
+    effect: "exec",
+    execute: (input, context) =>
+      (input.background === true ? startBackground : runShell)(input, context, { shell, graceMs, spillLimit, spillDir: options.spillDir, sandbox: options.sandbox ?? null, env: options.env ?? null }),
+  }
+}
+
+async function runShell(
+  input: ShellInput,
+  context: ToolContext,
+  options: { shell: string; graceMs: number; spillLimit: number; spillDir: string; sandbox: CommandSandbox | null; env: Readonly<Record<string, string | undefined>> | null },
+): Promise<ToolResult> {
+  const startedAt = performance.now()
+  const timeoutSeconds = input.timeout ?? DEFAULT_TIMEOUT_SECONDS
+  const early = callStopReasonOf(context.signal)
+  if (early !== null) return finish({ buffer: null, stopReason: early, exitCode: null, signalCode: null, timeoutSeconds, startedAt, spill: null })
+
+  // Decided before anything is created: a command that must run sandboxed runs sandboxed or not at all.
+  const wrapped = context.sandbox === undefined || context.sandbox === null ? null : sandboxed(input.command, context, options)
+  if (wrapped !== null && "refused" in wrapped)
+    return { status: "error", output: `Could not start the command: ${wrapped.refused}`, truncation: null, attachments: [], display: { exitCode: null, signal: null, timedOut: false, interrupted: null } }
+
+  const spillDir = context.spillDir ?? options.spillDir
+  await mkdir(spillDir, { recursive: true })
+  const spillPath = join(spillDir, `shell-${safeName(context.messageId)}-${safeName(context.callId)}.log`)
+  const buffer = createOutputBuffer(Bun.file(spillPath).writer(), options.spillLimit, context)
+
+  const spawned = spawn(wrapped ?? { argv: [options.shell, "-c", input.command], env: unsandboxedEnv(context, options), cwd: context.cwd })
+  if (spawned instanceof Error) {
+    void wrapped?.ended?.()
+    await buffer.close()
+    await unlink(spillPath).catch(() => {})
+    return {
+      status: "error",
+      output: `Could not start the command: ${spawned.message}`,
+      truncation: null,
+      attachments: [],
+      display: { exitCode: null, signal: null, timedOut: false, interrupted: null },
+    }
+  }
+  const child = spawned
+  wrapped?.started?.(child.pid)
+  const group = createGroup(child.pid, options.graceMs)
+  const guard = guardGroup(child.pid)
+
+  let stopReason: StopReason | null = null
+  const stop = (reason: StopReason) => {
+    stopReason ??= reason
+    void group.terminate()
+  }
+  const onAbort = () => stop(callStopReasonOf(context.signal) ?? "user")
+  context.signal.addEventListener("abort", onAbort, { once: true })
+  const timer = setTimeout(() => stop("timeout"), timeoutSeconds * 1000)
+
+  const readers = [child.stdout.getReader(), child.stderr.getReader()]
+  const pumps = Promise.all(
+    readers.map(async (reader) => {
+      for (;;) {
+        const next = await reader.read().catch(() => ({ done: true as const, value: undefined }))
+        if (next.done) return
+        buffer.append(next.value)
+      }
+    }),
+  )
+
+  const exitCode = await child.exited
+  clearTimeout(timer)
+  context.signal.removeEventListener("abort", onAbort)
+  // Whatever is left of the group (background jobs, a grandchild that ignored SIGTERM) is stopped now.
+  await group.terminate()
+  guard.release()
+  // The call is over when nothing of the command's sandbox is left: the next command is then planned beside none.
+  await wrapped?.ended?.()
+  const drained = await Promise.race([pumps.then(() => true), Bun.sleep(DRAIN_MS).then(() => false)])
+  if (!drained) await Promise.all(readers.map((reader) => reader.cancel().catch(() => {})))
+  await buffer.close()
+
+  return finish({
+    buffer,
+    stopReason,
+    exitCode: child.signalCode === null ? exitCode : null,
+    signalCode: child.signalCode === null ? null : String(child.signalCode),
+    timeoutSeconds,
+    startedAt,
+    spill: { path: spillPath, limit: options.spillLimit },
+  })
+}
+
+/**
+ * Starts the command and hands it to the session (`ToolContext.background`),
+ * which records it, stops it with the session and tells the model when it
+ * exits. It is spawned exactly as a foreground command is: the same sandbox
+ * decision, its own process group, the guard that kills the group when this
+ * process dies. Its output goes to a log file as it arrives.
+ */
+async function startBackground(
+  input: ShellInput,
+  context: ToolContext,
+  options: { shell: string; graceMs: number; spillLimit: number; spillDir: string; sandbox: CommandSandbox | null; env: Readonly<Record<string, string | undefined>> | null },
+): Promise<ToolResult> {
+  const refused = (output: string): ToolResult => ({ status: "error", output, truncation: null, attachments: [], display: { exitCode: null, signal: null, timedOut: false, interrupted: null } })
+  const host = context.background
+  if (host === undefined) return refused("Background commands are not available here. Run the command without `background`.")
+  const early = callStopReasonOf(context.signal)
+  if (early !== null) return refused(early === "call" ? "The command was not started: the user stopped this call." : "The command was not started: the session was interrupted.")
+  const wrapped = context.sandbox === undefined || context.sandbox === null ? null : sandboxed(input.command, context, options)
+  if (wrapped !== null && "refused" in wrapped) return refused(`Could not start the command: ${wrapped.refused}`)
+
+  const spillDir = context.spillDir ?? options.spillDir
+  await mkdir(spillDir, { recursive: true })
+  const logPath = join(spillDir, `shell-bg-${safeName(context.messageId)}-${safeName(context.callId)}.log`)
+  const sink = Bun.file(logPath).writer()
+  // No progress events: the call is over long before the command prints anything.
+  const buffer = createOutputBuffer(sink, options.spillLimit, { ...context, progress: () => {} })
+  const spawned = spawn(wrapped ?? { argv: [options.shell, "-c", input.command], env: unsandboxedEnv(context, options), cwd: context.cwd })
+  if (spawned instanceof Error) {
+    void wrapped?.ended?.()
+    await buffer.close()
+    await unlink(logPath).catch(() => {})
+    return refused(`Could not start the command: ${spawned.message}`)
+  }
+  const child = spawned
+  wrapped?.started?.(child.pid)
+  const group = createGroup(child.pid, options.graceMs)
+  const guard = guardGroup(child.pid)
+  const startedAt = performance.now()
+  let timedOut = false
+  const timer =
+    input.timeout === undefined
+      ? null
+      : setTimeout(() => {
+          timedOut = true
+          void group.terminate()
+        }, input.timeout * 1000)
+  const readers = [child.stdout.getReader(), child.stderr.getReader()]
+  const pumps = Promise.all(
+    readers.map(async (reader) => {
+      for (;;) {
+        const next = await reader.read().catch(() => ({ done: true as const, value: undefined }))
+        if (next.done) return
+        buffer.append(next.value)
+        // The log is read while the command runs.
+        void sink.flush()
+      }
+    }),
+  )
+  const shown = () => renderBody(buffer, { path: logPath, limit: options.spillLimit }).body
+  const exited = (async () => {
+    const exitCode = await child.exited
+    if (timer !== null) clearTimeout(timer)
+    await group.terminate()
+    guard.release()
+    await wrapped?.ended?.()
+    const drained = await Promise.race([pumps.then(() => true), Bun.sleep(DRAIN_MS).then(() => false)])
+    if (!drained) await Promise.all(readers.map((reader) => reader.cancel().catch(() => {})))
+    await buffer.close()
+    return {
+      exitCode: child.signalCode === null ? exitCode : null,
+      signal: child.signalCode === null ? null : String(child.signalCode),
+      timedOut,
+      durationMs: Math.round(performance.now() - startedAt),
+      output: shown(),
+    }
+  })()
+  const { id } = host.command({
+    command: input.command,
+    logPath,
+    stop: async () => {
+      await group.terminate()
+      await exited
+    },
+    output: shown,
+    lines: buffer.lines,
+    exited,
+  })
+  return {
+    status: "success",
+    output: `Started in the background as ${id}. Its output is written to ${logPath}. You will get a message when it exits; meanwhile ${"`background_output`"} shows its output so far and ${"`background_stop`"} stops it.`,
+    truncation: null,
+    attachments: [],
+    display: { background: id, logPath },
+  }
+}
+
+/**
+ * What to spawn for a command that runs in the sandbox, or why it cannot.
+ * `started` and `ended`, where the plan has them, are the sandbox's to be
+ * told which process was spawned and that it has exited (`SandboxPlan`).
+ */
+function sandboxed(command: string, context: ToolContext, options: { shell: string; sandbox: CommandSandbox | null }) {
+  if (options.sandbox === null) return { refused: "it must run in the sandbox, and this build has none" }
+  const plan = options.sandbox.plan({ sessionId: context.sessionId, cwd: context.cwd, run: context.sandbox!, command, shellPath: options.shell })
+  if (plan.kind !== "ready") return { refused: `it must run in the sandbox, which is unavailable: ${plan.reason}` }
+  return { argv: plan.argv, env: plan.env, cwd: plan.cwd, started: plan.started, ended: plan.ended }
+}
+
+/** The environment of a command that runs without the sandbox: the harness's own, without what the session's commands are not given. */
+function unsandboxedEnv(context: ToolContext, options: { sandbox: CommandSandbox | null; env: Readonly<Record<string, string | undefined>> | null }) {
+  return options.env ?? options.sandbox?.environment?.unsandboxed(context.sessionId) ?? process.env
+}
+
+function spawn(plan: { readonly argv: readonly string[]; readonly env: Readonly<Record<string, string | undefined>>; readonly cwd: string }) {
+  try {
+    return Bun.spawn([...plan.argv], {
+      cwd: plan.cwd,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      // Its own process group. The sandbox wrapper relies on it too: the kill sequence below reaches everything inside.
+      detached: true,
+      env: { ...plan.env, PAGER: "cat", GIT_PAGER: "cat", GIT_TERMINAL_PROMPT: "0" },
+    })
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error))
+  }
+}
+
+/** The process group led by `pid`. `terminate` is idempotent: later calls wait for the first. */
+function createGroup(pid: number, graceMs: number) {
+  let terminating: Promise<void> | null = null
+  const send = (signal: NodeJS.Signals | 0) => {
+    try {
+      process.kill(-pid, signal)
+      return true
+    } catch {
+      return false
+    }
+  }
+  const alive = () => send(0)
+  return {
+    terminate: () => {
+      terminating ??= (async () => {
+        if (!send("SIGTERM")) return
+        const deadline = performance.now() + graceMs
+        while (performance.now() < deadline) {
+          await Bun.sleep(25)
+          if (!alive()) return
+        }
+        send("SIGKILL")
+      })()
+      return terminating
+    },
+  }
+}
+
+/**
+ * Makes sure the group led by `pid` does not outlive this process, however
+ * the process ends (a crash, SIGKILL, a second Ctrl-C). The command runs in
+ * its own process group, so nothing the operating system does to this
+ * process reaches it; while this process lives, `createGroup` stops it.
+ *
+ * The guard is a small shell process in a session of its own that blocks
+ * reading a pipe only this process holds the other end of. When this process
+ * dies, for any reason, the pipe closes, the read returns and the guard kills
+ * the group. `release` ends the guard once the command is over.
+ * It is best effort: if the guard cannot be started the command still runs.
+ */
+function guardGroup(pid: number): { release: () => void } {
+  try {
+    // `kill -s KILL -- -<pgid>` is the form every POSIX shell accepts for a process group (dash rejects `-KILL -- -<pgid>`).
+    const guard = Bun.spawn(["/bin/sh", "-c", 'read -r _; kill -s KILL -- "-$1" 2>/dev/null', "guard", String(pid)], {
+      stdin: "pipe",
+      stdout: "ignore",
+      stderr: "ignore",
+      detached: true,
+    })
+    guard.unref()
+    return {
+      release: () => {
+        try {
+          guard.kill("SIGKILL")
+        } catch {
+          // Already gone.
+        }
+      },
+    }
+  } catch {
+    return { release: () => {} }
+  }
+}
+
+type OutputBuffer = ReturnType<typeof createOutputBuffer>
+
+/**
+ * Spills every byte (up to the limit) and keeps the first and last bytes, the byte counts and the line count.
+ * With the harness's redaction in the context, the output is redacted as it arrives, before any of that: the
+ * progress, the spill file, the counts and the text the model is shown all hold the redacted output.
+ */
+function createOutputBuffer(sink: Bun.FileSink, spillLimit: number, context: ToolContext) {
+  const head = new Uint8Array(HEAD_KEEP)
+  let headLength = 0
+  // A ring one byte longer than the tail, so the byte before the tail is known (is the tail at a line start?).
+  const ring = new Uint8Array(TAIL_KEEP + 1)
+  let ringEnd = 0
+  let total = 0
+  let newlines = 0
+  let lastByte = -1
+  let spilled = 0
+  let lastProgress = 0
+  let closed = false
+  // For `lines`: who listens, and the line that is being printed (its first `LINE_KEEP` bytes). Nothing is kept while nobody listens.
+  let listeners: Set<(line: string) => void> | null = null
+  const unfinished = new Uint8Array(LINE_KEEP)
+  let unfinishedLength = 0
+  const keep = (bytes: Uint8Array) => {
+    const part = bytes.subarray(0, LINE_KEEP - unfinishedLength)
+    unfinished.set(part, unfinishedLength)
+    unfinishedLength += part.length
+  }
+  const tell = (line: Uint8Array) => {
+    // A line cut in the middle of a character ends with the replacement character, which is as good as any cut.
+    const text = decoder.decode(line.length > 0 && line[line.length - 1] === 0x0d ? line.subarray(0, line.length - 1) : line)
+    for (const listener of [...(listeners ?? [])]) listener(text)
+  }
+  const follow = (chunk: Uint8Array) => {
+    let start = 0
+    for (let end = chunk.indexOf(0x0a); end !== -1; end = chunk.indexOf(0x0a, start)) {
+      keep(chunk.subarray(start, end))
+      tell(unfinished.subarray(0, unfinishedLength))
+      unfinishedLength = 0
+      start = end + 1
+    }
+    keep(chunk.subarray(start))
+  }
+
+  const tailBytes = (keep: number) => {
+    const length = Math.min(total, keep)
+    const out = new Uint8Array(length)
+    for (let index = 0; index < length; index += 1) out[index] = ring[(ringEnd - length + index + ring.length * 2) % ring.length]!
+    return out
+  }
+
+  const take = (chunk: Uint8Array) => {
+    if (chunk.length === 0) return
+    if (spilled < spillLimit) {
+      const part = chunk.subarray(0, spillLimit - spilled)
+      sink.write(part)
+      spilled += part.length
+    }
+    if (headLength < HEAD_KEEP) {
+      const part = chunk.subarray(0, HEAD_KEEP - headLength)
+      head.set(part, headLength)
+      headLength += part.length
+    }
+    const recent = chunk.length > ring.length ? chunk.subarray(chunk.length - ring.length) : chunk
+    for (let offset = 0; offset < recent.length; ) {
+      const room = Math.min(ring.length - ringEnd, recent.length - offset)
+      ring.set(recent.subarray(offset, offset + room), ringEnd)
+      ringEnd = (ringEnd + room) % ring.length
+      offset += room
+    }
+    for (let index = chunk.indexOf(0x0a); index !== -1; index = chunk.indexOf(0x0a, index + 1)) newlines += 1
+    total += chunk.length
+    lastByte = chunk[chunk.length - 1]!
+    if (listeners !== null) follow(chunk)
+    const now = performance.now()
+    if (now - lastProgress >= PROGRESS_INTERVAL_MS) {
+      lastProgress = now
+      context.progress({ text: lastLines(tailBytes(4096), PROGRESS_LINES) })
+    }
+  }
+  const redacting = context.redact === undefined ? null : redactingStream({ redact: context.redact, ...(context.unfinishedSecret === undefined ? {} : { unfinishedSecret: context.unfinishedSecret }) }, take)
+
+  return {
+    append(chunk: Uint8Array) {
+      if (closed || chunk.length === 0) return
+      if (redacting === null) take(chunk)
+      else redacting.write(chunk)
+    },
+    async close() {
+      if (closed) return
+      redacting?.end()
+      closed = true
+      // The last line of a command that ended without a line break is a line too.
+      if (listeners !== null && unfinishedLength > 0) tell(unfinished.subarray(0, unfinishedLength))
+      unfinishedLength = 0
+      await sink.end()
+    },
+    /** `BackgroundCommand.lines`: the complete lines still in memory, then each further line as it completes. */
+    lines(listener: (line: string) => void): () => void {
+      const recent = tailBytes(TAIL_KEEP + 1)
+      // Whether what is in memory starts at the start of a line: all of the output does, the tail only after a line break.
+      const whole = total <= TAIL_KEEP
+      const bytes = whole ? recent : recent.subarray(1)
+      const lastBreak = bytes.lastIndexOf(0x0a)
+      if (listeners === null) {
+        // From here on lines are assembled as they arrive: the line being printed right now is the end of the tail.
+        listeners = new Set()
+        unfinishedLength = 0
+        if (!closed) keep(bytes.subarray(lastBreak + 1))
+      }
+      let start = whole || recent[0] === 0x0a ? 0 : bytes.indexOf(0x0a) + 1
+      const found = listeners
+      found.add(listener)
+      while (start <= lastBreak && found.has(listener)) {
+        const end = bytes.indexOf(0x0a, start)
+        const line = bytes.subarray(start, Math.min(end, start + LINE_KEEP))
+        listener(decoder.decode(line.length > 0 && line[line.length - 1] === 0x0d ? line.subarray(0, line.length - 1) : line))
+        start = end + 1
+      }
+      // A command that has ended printed its last line without a line break: it is in memory, and nothing follows.
+      if (closed && lastBreak + 1 < bytes.length && found.has(listener)) listener(decoder.decode(bytes.subarray(lastBreak + 1, lastBreak + 1 + LINE_KEEP)))
+      return () => void found.delete(listener)
+    },
+    get totalBytes() {
+      return total
+    },
+    get totalLines() {
+      return total > 0 && lastByte !== 0x0a ? newlines + 1 : newlines
+    },
+    get spilledBytes() {
+      return spilled
+    },
+    head: () => head.subarray(0, headLength),
+    /** The last bytes and whether they start a line. */
+    tail: () => {
+      const withBefore = tailBytes(TAIL_KEEP + 1)
+      if (total <= TAIL_KEEP) return { bytes: withBefore, atLineStart: true }
+      return { bytes: withBefore.subarray(1), atLineStart: withBefore[0] === 0x0a }
+    },
+  }
+}
+
+const decoder = new TextDecoder()
+
+function lastLines(bytes: Uint8Array, count: number): string {
+  let start = 0
+  while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start += 1
+  const lines = decoder.decode(bytes.subarray(start)).split("\n")
+  if (lines[lines.length - 1] === "") lines.pop()
+  return lines.slice(-count).join("\n")
+}
+
+async function finish(run: {
+  buffer: OutputBuffer | null
+  stopReason: StopReason | null
+  exitCode: number | null
+  signalCode: string | null
+  timeoutSeconds: number
+  startedAt: number
+  spill: { path: string; limit: number } | null
+}): Promise<ToolResult> {
+  const buffer = run.buffer
+  const { body, capped } = renderBody(buffer, run.spill)
+  if (!capped && run.spill !== null) await unlink(run.spill.path).catch(() => {})
+  const status = statusLine(run)
+  const text = body === "" ? "(no output)" : body
+  const output = status === null ? text : `${text}${text.endsWith("\n") ? "" : "\n"}${status}`
+  return {
+    status: status === null ? "success" : "error",
+    output,
+    truncation: capped ? { originalBytes: buffer!.totalBytes, originalLines: buffer!.totalLines, spillPath: run.spill!.path } : null,
+    attachments: [],
+    display: {
+      exitCode: run.exitCode,
+      signal: run.signalCode,
+      timedOut: run.stopReason === "timeout",
+      interrupted: run.stopReason === "user" || run.stopReason === "shutdown" ? run.stopReason : null,
+      // Only when the user stopped this one call: what `interrupted` is for the whole turn.
+      ...(run.stopReason === "call" ? { cancelled: true } : {}),
+      durationMs: Math.round(performance.now() - run.startedAt),
+    },
+  }
+}
+
+/** What a command printed, as the model is shown it: all of it when it fits, else its beginning and end with the path of the whole. */
+function renderBody(buffer: OutputBuffer | null, spill: { path: string; limit: number } | null): { readonly body: string; readonly capped: boolean } {
+  const capped = buffer !== null && spill !== null && !fitsLimits(buffer.totalBytes, buffer.totalLines, BODY_LIMITS)
+  if (buffer === null || buffer.totalBytes === 0) return { body: "", capped }
+  if (!capped) return { body: decoder.decode(buffer.head()), capped }
+  const tail = buffer.tail()
+  return {
+    body: renderCapped({ head: buffer.head(), tail: tail.bytes, tailAtLineStart: tail.atLineStart, totalBytes: buffer.totalBytes, totalLines: buffer.totalLines }, { path: spill!.path, savedBytes: buffer.spilledBytes }, BODY_LIMITS),
+    capped,
+  }
+}
+
+function statusLine(run: { stopReason: StopReason | null; exitCode: number | null; signalCode: string | null; timeoutSeconds: number; buffer: OutputBuffer | null }) {
+  const stopped =
+    run.buffer === null ? "The command was not started." : "The command and its child processes were stopped; the output above is everything it printed before that."
+  switch (run.stopReason) {
+    case "timeout":
+      return `[Timed out after ${run.timeoutSeconds} ${run.timeoutSeconds === 1 ? "second" : "seconds"}. ${stopped}]`
+    case "user":
+      return `[Interrupted by the user. ${stopped}]`
+    case "shutdown":
+      return `[Interrupted because the harness is shutting down. ${stopped}]`
+    case "call":
+      // The user stopped this command and nothing else: the turn goes on, and this is its result.
+      return `[Stopped by the user. ${stopped}]`
+    case null:
+      if (run.signalCode !== null) return `[Killed by signal ${run.signalCode}]`
+      if (run.exitCode !== 0) return `[Exit code ${run.exitCode}]`
+      return null
+  }
+}
+
+function safeName(id: string) {
+  return id.replace(/[^A-Za-z0-9_.-]/g, "_")
+}

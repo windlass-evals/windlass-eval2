@@ -1,0 +1,130 @@
+/**
+ * The interactive line CLI as a first-time user meets it: it says which
+ * session it opened (and, resumed, its title and turns), `/help` lists the
+ * commands, an unknown `/word` is not sent to the model, `//` sends a message
+ * that starts with a slash, and leaving says how to come back.
+ */
+import { afterAll, expect, setDefaultTimeout, test } from "bun:test"
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { brand } from "@windlass/core"
+import { FakeProvider, script, waitFor as waitUntil } from "@windlass/core/testing"
+import { createAcpEngine } from "../src/acp-engine.ts"
+import { resumeLine } from "../src/main.ts"
+import { runCli } from "./helpers.ts"
+import { VirtualTerminal } from "./vt.ts"
+
+setDefaultTimeout(30_000)
+
+const root = realpathSync(mkdtempSync(join(tmpdir(), "wl-cli-interactive-")))
+afterAll(() => rmSync(root, { recursive: true, force: true }))
+const workspace = join(root, "work")
+mkdirSync(workspace)
+
+/** One interactive run on the shared data directory; `drive` types, waiting for output first. */
+async function session(provider: FakeProvider, args: readonly string[], drive: (type: (keys: string) => void, waitFor: (needle: string | RegExp) => Promise<void>) => Promise<void>) {
+  const engine = () => createAcpEngine({ transport: "memory", harness: { dataDir: join(root, "data"), provider, log: () => {}, engine: { discover: () => [], loadConfig: null } }, stderr: () => {} })
+  const vt = new VirtualTerminal(100)
+  let seen = ""
+  let typer: ((data: string) => void) | null = null
+  const waitFor = async (needle: string | RegExp): Promise<void> => {
+    await waitUntil(() => (typeof needle === "string" ? seen.includes(needle) : needle.test(seen)), { timeoutMs: 10_000, intervalMs: 5, what: String(needle), describe: () => `screen:\n${vt.text}` })
+  }
+  const running = runCli(["--cwd", workspace, ...args], {
+    engine,
+    stdinTTY: true,
+    stdoutTTY: true,
+    columns: 100,
+    env: { NO_COLOR: "1" },
+    keys: (type) => {
+      typer = type
+    },
+    onWrite: (text) => {
+      seen += text
+      vt.write(text)
+    },
+  })
+  await waitFor("› ")
+  await drive((keys) => typer!(keys), waitFor)
+  const result = await running
+  return { ...result, screen: vt.text }
+}
+
+test("the session is named on start and on leaving; /help lists commands; an unknown /word is never sent; // sends one slash", async () => {
+  const provider = new FakeProvider([[script.text("Paths under /etc are config.")]])
+  const first = await session(provider, [], async (type, waitFor) => {
+    // Which session, and the model it runs on.
+    await waitFor(/new session ses_\w+ · model [\w.-]+ · \/help lists the commands/)
+    type("/help\r")
+    await waitFor("/undo")
+    type("/hepl\r")
+    await waitFor("/hepl is not a command")
+    type("/etc is where configuration lives?\r")
+    await waitFor("/etc is not a command")
+    type("//etc is where configuration lives?\r")
+    await waitFor("✓ done")
+    type("\x04")
+  })
+  expect(first.code).toBe(0)
+  const flat = first.screen.replace(/\n\s+/g, " ")
+  // The help: every command, with what it does, and the keys.
+  for (const line of ["/undo", "/redo", "/diff", "/approval [ask|auto|full] (/mode)", "/clear-taint", "/queue <message>", "/help", "/exit (/quit)", "Ctrl-D on an empty prompt leaves."]) expect(flat).toContain(line)
+  expect(flat).toContain("/hepl is not a command, so nothing was sent; did you mean /help? (/help lists them). To send a message that starts with a slash, begin it with two: //hepl")
+  // The unknown commands cost no model call; the escaped message is the only one the model saw, with one slash.
+  expect(provider.requests.length).toBe(1)
+  expect(JSON.stringify(provider.requests[0]!.input)).toContain("/etc is where configuration lives?")
+  expect(JSON.stringify(provider.requests[0]!.input)).not.toContain("//etc")
+  const id = /new session (ses_\w+)/.exec(first.screen)![1]!
+  // The last lines: at 100 columns the one line would not fit, so the command is on a line of its own and no ID is split.
+  expect(first.screen.trimEnd().split("\n").slice(-2)).toEqual([`${brand.binary}: session ${id}`, `  resume with: ${brand.binary} --session ${id}`])
+  expect(resumeLine(id, 120)).toBe(`${brand.binary}: session ${id} · resume with: ${brand.binary} --session ${id}\n`)
+
+  // Resumed: its title and how many turns it has.
+  const second = await session(new FakeProvider([]), ["-c"], async (type, waitFor) => {
+    await waitFor("resumed session")
+    type("\x04")
+  })
+  const model = / · model ([\w.-]+) · /.exec(first.screen)![1]!
+  expect(second.screen.replace(/\n\s+/g, " ")).toContain(`resumed session ${id} "/etc is where configuration lives?" · 1 turn · model ${model} · /help lists the commands`)
+
+  // Resumed on another model: the change is said, and the session line names the model it runs on from here.
+  const third = await session(new FakeProvider([]), ["-c", "-m", "gpt-other", "--effort", "low"], async (type, waitFor) => {
+    await waitFor("resumed session")
+    type("\x04")
+  })
+  const shown = third.screen.replace(/\n\s+/g, " ")
+  expect(shown).toContain(`resumed session ${id} "/etc is where configuration lives?" · 1 turn · model gpt-other · effort low · /help lists the commands`)
+  // Under the session's line, with what it changed from.
+  expect(shown.indexOf(`⇄ model ${model} → gpt-other · effort default → low · from the next step`)).toBeGreaterThan(shown.indexOf("resumed session"))
+})
+
+test("a slash command typed at an approval question does not answer it: the question waits, and the answer that follows is the answer", async () => {
+  const provider = new FakeProvider([
+    [script.toolCall("c1", "write", { path: "one.txt", content: "1\n" }), script.toolCall("c2", "write", { path: "two.txt", content: "2\n" })],
+    [script.text("Both written.")],
+  ])
+  const run = await session(provider, ["--approval", "ask"], async (type, waitFor) => {
+    type("write two files\r")
+    // The question's first line may be cut at the width (a long temporary directory, as on macOS); the line under it names the file in full.
+    await waitFor(new RegExp(`${RegExp.escape(join(workspace, "one.txt"))}[\\s\\S]*\\[N\\]o › `))
+    type("a\r")
+    await waitFor(new RegExp(`${RegExp.escape(join(workspace, "two.txt"))}[\\s\\S]*\\[N\\]o › `))
+    type("/mcp\r")
+    await waitFor("so /mcp was not run")
+    type("a\r")
+    await waitFor("✓ done")
+    type("\x04")
+  })
+  expect(run.code).toBe(0)
+  const flat = run.screen.replace(/\n\s+/g, " ")
+  expect(flat).toContain("a question is waiting for your answer, so /mcp was not run; answer the question, then type /mcp again")
+  // Neither call was declined, and no listing of servers was printed in the middle of the question.
+  expect(flat).not.toContain("not allowed")
+  expect(flat).not.toContain("MCP servers")
+  expect(flat.match(/✓ allowed once/g)).toHaveLength(2)
+  expect([existsSync(join(workspace, "one.txt")), existsSync(join(workspace, "two.txt"))]).toEqual([true, true])
+  // What became of the first answer is said before the second question is put.
+  expect(flat.indexOf(join(workspace, "two.txt"))).toBeGreaterThan(0)
+  expect(flat.indexOf("✓ allowed once")).toBeLessThan(flat.indexOf(join(workspace, "two.txt")))
+})

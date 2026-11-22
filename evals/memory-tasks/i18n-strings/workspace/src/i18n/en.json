@@ -1,0 +1,8 @@
+{
+  "cart.heading": "Your cart",
+  "checkout.heading": "Checkout",
+  "checkout.pay": "Pay {amount}",
+  "checkout.card-declined": "Your card was declined. Try another card.",
+  "orders.heading": "Your orders",
+  "orders.none": "You haven't ordered anything yet."
+}

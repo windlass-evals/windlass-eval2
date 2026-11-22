@@ -1,0 +1,605 @@
+/**
+ * Compaction: what the loop writes when a conversation outgrows the model's
+ * context window. Before every step the loop estimates the size of the
+ * request it would send and asks the compaction policy; these scenarios fix
+ * what follows from each answer, and what happens when the summary, the
+ * user or the process does not cooperate.
+ *
+ * Sizes are the provider's: each step's usage says how many input tokens its
+ * request had. In the scenarios with a context window it is 10,000 tokens,
+ * of which the policy keeps 2,000 free for the answer: from 5,200 tokens the
+ * next request is "due soon" (compact at the next user message), from 6,400
+ * it is compacted before it is sent. The budget for history kept word for
+ * word is zero at that size, so a compaction keeps exactly what the next
+ * call has to answer: the new input at a user-message boundary, the last
+ * step in the middle of a turn.
+ *
+ * One thing no scenario shows, because nothing is written for it: a normal
+ * compaction that would take out less than a quarter of what is in view
+ * (one huge tool result is the last step) is not made. While the request
+ * still fits, the loop sends it; when it does not, the compaction is
+ * aggressive at once. `test/engine/compaction.test.ts` covers it.
+ */
+import { createHash } from "node:crypto"
+import type { BlobRef } from "../../src/content.ts"
+import { event } from "../../src/event/durable.ts"
+import { todoList } from "../../src/tools/todo.ts"
+import {
+  NOT_A_SUMMARY,
+  NOT_A_SUMMARY_PROBLEMS,
+  type Scenario,
+  SUMMARY,
+  UNUSABLE,
+  WINDOW,
+  baseline,
+  c,
+  called,
+  checkpoint,
+  compactionEnded,
+  compactionFailed,
+  compactionRepair,
+  compactionStarted,
+  deliver,
+  enqueue,
+  executionInterrupted,
+  executionResumed,
+  executionStarted,
+  executionSucceeded,
+  interruptMarker,
+  interruptRequested,
+  m,
+  opening,
+  providerError,
+  ran,
+  say,
+  stepEnded,
+  stepEndedAt,
+  stepProviderFailed,
+  stepStarted,
+  toolStarted,
+} from "./script.ts"
+
+/** One step that reads a file, measured at `inputTokens`. Five events. */
+const reads = (id: string, path: string, output: string, inputTokens: number) => [
+  stepStarted(id),
+  ...ran(id, "call_1", "read", JSON.stringify({ path }), output),
+  stepEndedAt(id, inputTokens, "tool_calls"),
+]
+/** One step that answers, measured at `inputTokens`. Three events. */
+const answers = (id: string, value: string, inputTokens: number) => [stepStarted(id), say(id, value), stepEndedAt(id, inputTokens)]
+
+// ---------------------------------------------------------------- at a user-message boundary
+
+const dueTurn = [...opening(), ...reads("a1", "a.test.ts", "expect(add(1, 1)).toBe(3)", 4800), ...answers("a2", "The expectation is wrong: 1 + 1 is 2.", 4900), executionSucceeded()]
+const dueInput = [enqueue("u2", "Then fix it."), executionStarted("exe_2"), deliver("u2")]
+
+export const atUserBoundary: Scenario = {
+  title: "A compaction that is due waits for the next user message",
+  description:
+    "The first turn grows the request past the early threshold. That is not urgent, so nothing happens between its steps: a compaction in the middle of a turn costs the model the thread of what it was doing. When the user's next message is delivered, the request is still over the threshold, and now is the moment: the loop compacts before it calls the model. The cut is right before the new message, so the checkpoint replaces the first turn and the message stays word for word. `compaction.started` records the cut, the mode and the prompt before the summary request is sent; `compaction.ended` freezes the checkpoint (the summary, the identifier index, the user's earlier messages verbatim). The baseline is set again, and the next request is the checkpoint, the new message and nothing else.",
+  provider: "turn 1 is measured at 4,800 and 4,900 input tokens; the summary call returns a summary of the required form; turn 2 answers",
+  contextWindow: WINDOW,
+  phases: [
+    {
+      label: "first turn: over the early threshold, and nothing is compacted in the middle of it",
+      events: dueTurn,
+      expect: { history: ["u1", "a1", "a2"], execution: null },
+    },
+    {
+      label: "the next message is delivered: compact before the model is called",
+      events: [...dueInput, compactionStarted("c1", 17)],
+      expect: { open: "c1", history: ["u1", "a1", "a2", "u2"] },
+      rejects: [
+        { event: stepStarted("a3"), code: "invalid_transition", why: "the compaction is open: no step starts until it has ended" },
+        { event: baseline(), code: "invalid_transition", why: "the baseline is set again only once the compaction has completed" },
+      ],
+    },
+    {
+      label: "the checkpoint, the baseline again, and the answer",
+      events: [compactionEnded("c1", checkpoint([...dueTurn, ...dueInput], 17)), baseline(), ...answers("a3", "Changed the expectation to 2.", 1200), executionSucceeded("exe_2")],
+      expect: {
+        ui: [{ id: "u1" }, { id: "a1" }, { id: "a2" }, { id: "u2" }, { id: "c1", kind: "compaction", status: "completed" }, { id: "a3" }],
+        history: ["c1", "u2", "a3"],
+        execution: null,
+      },
+    },
+  ],
+}
+
+// ---------------------------------------------------------------- in the middle of a turn
+
+const longTurn = [
+  ...opening("Find out why the build is slow."),
+  ...reads("a1", "build.ts", "await bundle(entries)", 3000),
+  ...reads("a2", "bundle.ts", "for (const entry of entries) await compile(entry)", 4000),
+  ...reads("a3", "compile.ts", "const cache = new Map()", 6000),
+]
+
+export const midTurn: Scenario = {
+  title: "A compaction in the middle of a long turn",
+  description:
+    "One turn keeps reading files until the next request would be over the trigger. Waiting for a user message is no longer possible, so the loop compacts between two steps. The cut falls inside the turn: the last step, with its call and its result, is kept word for word, because the next model call answers it; the turn's request and its earlier steps go into the checkpoint, which quotes the request verbatim and ends by telling the model that the work was in progress and to carry on. The model continues the same turn from the checkpoint and the kept step.",
+  provider: "the three reading steps are measured at 3,000, 4,000 and 6,000 input tokens; the summary call returns a summary; the model then answers",
+  contextWindow: WINDOW,
+  phases: [
+    {
+      label: "three steps; after the third the next request is over the trigger",
+      events: longTurn,
+      expect: { history: ["u1", "a1", "a2", "a3"], open: null },
+    },
+    {
+      label: "compact between two steps, keeping the last one",
+      events: [compactionStarted("c1", 16), compactionEnded("c1", checkpoint(longTurn, 16, SUMMARY, true)), baseline()],
+      expect: { history: ["c1", "a3"], open: null, execution: { status: "running", crashResumes: 0 } },
+      rejects: [
+        {
+          event: compactionStarted("c2", 15),
+          code: "invalid_range",
+          why: "the cut only moves forward: a later compaction cannot keep what this one replaced",
+        },
+      ],
+    },
+    {
+      label: "the turn carries on",
+      events: [...answers("a4", "Every entry is compiled one after the other, and the cache is never read.", 1500), executionSucceeded()],
+      expect: {
+        ui: [{ id: "u1" }, { id: "a1" }, { id: "a2" }, { id: "a3" }, { id: "c1", kind: "compaction", status: "completed" }, { id: "a4" }],
+        history: ["c1", "a3", "a4"],
+        execution: null,
+      },
+    },
+  ],
+}
+
+// ---------------------------------------------------------------- the provider rejects a request
+
+const overflow = providerError("context_overflow", "The input exceeds the context window", 400)
+const overflowTurns = [
+  ...opening("Explain the architecture."),
+  stepStarted("a1"),
+  say("a1", "A long explanation."),
+  stepEnded("a1"),
+  executionSucceeded(),
+  enqueue("u2", "Now explain the reducer."),
+  executionStarted("exe_2"),
+  deliver("u2"),
+  stepStarted("a2"),
+  stepProviderFailed("a2", overflow),
+]
+
+export const contextOverflow: Scenario = {
+  title: "The provider rejects a request as too large: compact aggressively and rebuild",
+  description:
+    "Nobody told the engine the model's context window, so nothing was compacted ahead of time, and in the second turn the provider rejects the request. That is a fact, not an estimate: the loop compacts aggressively (trigger `overflow`) and rebuilds the request (retry rule 5). A compaction can start only at a boundary, so the rejected attempt is first closed as failed, with an empty body, and stays in the log. An aggressive compaction keeps only what fits a small budget, and here nothing does: the new prompt itself goes into the checkpoint, quoted verbatim, with the sentence that the work continues. A second rejection right after this compaction fails the execution.",
+  provider: "turn 2, attempt 1 fails with context_overflow before output; the summary call returns a summary; the rebuilt call answers",
+  phases: [
+    {
+      label: "the second turn's request is rejected",
+      events: overflowTurns,
+      expect: { open: null, history: ["u1", "a1", "u2", "a2"] },
+    },
+    {
+      label: "compact aggressively, then rebuild",
+      events: [
+        compactionStarted("c1", 13, "overflow", "aggressive"),
+        compactionEnded("c1", checkpoint(overflowTurns, 13, SUMMARY, true)),
+        baseline(),
+        stepStarted("a3"),
+        say("a3", "The reducer folds events."),
+        stepEnded("a3"),
+        executionSucceeded("exe_2"),
+      ],
+      expect: {
+        ui: [
+          { id: "u1" },
+          { id: "a1" },
+          { id: "u2" },
+          { id: "a2", status: "failed", error: "provider:context_overflow", text: "" },
+          { id: "c1", kind: "compaction", status: "completed" },
+          { id: "a3" },
+        ],
+        history: ["c1", "a2", "a3"],
+        execution: null,
+      },
+    },
+  ],
+}
+
+// ---------------------------------------------------------------- a compaction that frees too little
+
+const heavy = [...opening("Go through the migration scripts."), ...reads("a1", "migrations/0001.sql", "CREATE TABLE ledger (id INTEGER)", 6000)]
+const firstCompaction = [compactionStarted("c1", 6), compactionEnded("c1", checkpoint(heavy, 6, SUMMARY, true)), baseline()]
+const held = [...reads("a2", "migrations/0002.sql", "ALTER TABLE ledger ADD COLUMN total", 5900), ...reads("a3", "migrations/0003.sql", "CREATE INDEX ledger_total", 7500)]
+const beforeSecond = [...heavy, ...firstCompaction, ...held]
+
+export const ineffective: Scenario = {
+  title: "A compaction that frees too little: the hold, one aggressive attempt, then nothing more",
+  description:
+    "The request is over the trigger and the loop compacts, but what must be kept is most of the context: the provider measures the first request after the compaction at almost the size before it. Compacting again at once would summarise a summary, so the policy holds: while the request still fits, the next steps are sent without a compaction, in the headroom between the trigger and the window. When a request would no longer fit at all, there is one aggressive compaction, which keeps nothing word for word. Here that frees too little as well, and nothing more is tried: the request is sent as it is. (Had the provider rejected it, the overflow rule would have ended the execution.) The loop never compacts in a circle.",
+  provider:
+    "the first step is measured at 6,000 input tokens; the step after the first compaction at 5,900, so it freed too little; the next at 7,500, which with the next result no longer fits; the step after the aggressive compaction again at 7,500; then the model answers",
+  contextWindow: WINDOW,
+  phases: [
+    {
+      label: "over the trigger: a normal compaction, which keeps the last step",
+      events: [...heavy, ...firstCompaction],
+      expect: { history: ["c1", "a1"], open: null },
+    },
+    {
+      label: "it freed too little: the next two requests are over the trigger and are sent anyway (the hold)",
+      events: held,
+      expect: { history: ["c1", "a1", "a2", "a3"], open: null },
+    },
+    {
+      label: "the next request would not fit: one aggressive compaction, which keeps nothing",
+      events: [compactionStarted("c2", 24, "auto", "aggressive"), compactionEnded("c2", checkpoint(beforeSecond, 24, SUMMARY, true)), baseline()],
+      expect: { history: ["c2"], open: null },
+    },
+    {
+      label: "that freed too little too: the request is sent as it is",
+      events: [...reads("a4", "migrations/0004.sql", "DROP INDEX ledger_total", 7500), ...answers("a5", "Four migrations; the last one drops the index the third one made.", 7600), executionSucceeded()],
+      expect: {
+        ui: [
+          { id: "u1" },
+          { id: "a1" },
+          { id: "c1", kind: "compaction", status: "completed" },
+          { id: "a2" },
+          { id: "a3" },
+          { id: "c2", kind: "compaction", status: "completed" },
+          { id: "a4" },
+          { id: "a5" },
+        ],
+        history: ["c2", "a4", "a5"],
+        execution: null,
+      },
+    },
+  ],
+}
+
+// ---------------------------------------------------------------- the summary is not usable
+
+/** A prompt and one step measured at 6,000 tokens: the next request is over the trigger, and the prompt is a fair share of what is in view. */
+const oneBigStep = [...opening("Find out why the add test fails, fix what is wrong, and tell me what you changed and why."), ...reads("a1", "a.test.ts", "expect(add(1, 1)).toBe(3)", 6000)]
+
+export const summaryRepaired: Scenario = {
+  title: "An invalid summary is repaired",
+  description:
+    "The model's answer to the summary request does not have the required sections. The loop asks once more: it records the rejected answer and what is wrong with it (`compaction.repair_requested`), and the second request is the first one plus that answer and the request to fix it, so it still reads everything before it from the cache and can be rebuilt from the log. The second answer is valid, and the compaction ends with `source: repaired`.",
+  provider: "the first step is measured at 6,000 input tokens; the summary call returns prose without the sections; the repair call returns a summary of the required form; the model then answers",
+  contextWindow: WINDOW,
+  phases: [
+    {
+      label: "the first answer is not a summary",
+      events: [...oneBigStep, compactionStarted("c1", 6)],
+      expect: { open: "c1" },
+      rejects: [
+        {
+          event: compactionEnded("c1", "A checkpoint.", "repaired"),
+          code: "invalid_transition",
+          why: "a compaction ends as repaired only after a repair was asked for",
+        },
+      ],
+    },
+    {
+      label: "one repair is asked for",
+      events: [compactionRepair("c1", NOT_A_SUMMARY, NOT_A_SUMMARY_PROBLEMS)],
+      expect: { open: "c1", history: ["u1", "a1"] },
+      rejects: [
+        {
+          event: compactionRepair("c1", NOT_A_SUMMARY, NOT_A_SUMMARY_PROBLEMS, 3),
+          code: "invalid_transition",
+          why: "a summary is repaired at most once",
+        },
+      ],
+    },
+    {
+      label: "the repaired summary is used",
+      events: [compactionEnded("c1", checkpoint(oneBigStep, 6, SUMMARY, true), "repaired"), baseline(), ...answers("a2", "The expectation is wrong: 1 + 1 is 2.", 1300), executionSucceeded()],
+      expect: {
+        ui: [{ id: "u1" }, { id: "a1" }, { id: "c1", kind: "compaction", status: "completed" }, { id: "a2" }],
+        history: ["c1", "a1", "a2"],
+        execution: null,
+      },
+    },
+  ],
+}
+
+export const summaryFallback: Scenario = {
+  title: "A summary that is still invalid: the checkpoint is built without the model",
+  description:
+    "The answer to the repair request is not usable either. The loop does not ask a third time and does not give up: it builds the checkpoint without a summary. It says plainly that there is none, and carries what needs no model: the identifier index, the user's messages verbatim, the assistant's last words, and the pointer to the history tools, with which the model can read the original messages. `compaction.ended` says `source: fallback` and why, so a client can tell the user. A compaction therefore always completes, and the session is never lost to a model that cannot summarise.",
+  provider: "the first step is measured at 6,000 input tokens; the summary call and the repair call both return prose without the sections; the model then answers",
+  contextWindow: WINDOW,
+  phases: [
+    {
+      label: "the first answer and the repair are both unusable",
+      events: [...oneBigStep, compactionStarted("c1", 6), compactionRepair("c1", NOT_A_SUMMARY, NOT_A_SUMMARY_PROBLEMS)],
+      expect: { open: "c1" },
+    },
+    {
+      label: "the compaction completes without a summary",
+      events: [
+        compactionEnded("c1", checkpoint(oneBigStep, 6, null, true), "fallback", UNUSABLE(NOT_A_SUMMARY_PROBLEMS)),
+        baseline(),
+        ...answers("a2", "The expectation is wrong: 1 + 1 is 2.", 1300),
+        executionSucceeded(),
+      ],
+      expect: {
+        ui: [{ id: "u1" }, { id: "a1" }, { id: "c1", kind: "compaction", status: "completed" }, { id: "a2" }],
+        history: ["c1", "a1", "a2"],
+        execution: null,
+      },
+    },
+  ],
+}
+
+// ---------------------------------------------------------------- cancel and crash
+
+export const interruptedCompaction: Scenario = {
+  title: "Cancel while the summary is being written",
+  description:
+    "The user cancels while the summary call is streaming. The compaction is closed as interrupted, the marker tells the model that it was stopped, and the claim is released. Nothing about history changed: a compaction that did not complete is only a row in the log. When the user sends the next message the request is as large as before, so the loop compacts again, now at a user-message boundary: the cut cannot fall between the marker and the step it follows, so that step, the marker and the new message are kept.",
+  provider: "the first step is measured at 6,000 input tokens; the summary call streams part of a summary and hangs; after the cancel, the second summary call returns a summary and the model answers",
+  contextWindow: WINDOW,
+  phases: [
+    {
+      label: "the user cancels during the summary call",
+      events: [
+        ...oneBigStep,
+        compactionStarted("c1", 6),
+        interruptRequested("user"),
+        compactionFailed("c1", { kind: "interrupted", reason: "user" }),
+        interruptMarker("s1", "user"),
+        executionInterrupted("user"),
+      ],
+      expect: {
+        ui: [{ id: "u1" }, { id: "a1" }, { id: "c1", kind: "compaction", status: "failed", error: "interrupted:user" }, { id: "s1", origin: "interrupt" }],
+        history: ["u1", "a1", "s1"],
+        execution: null,
+        open: null,
+      },
+    },
+    {
+      label: "the next message: the compaction is made again",
+      events: [
+        enqueue("u2", "Go on."),
+        executionStarted("exe_2"),
+        deliver("u2"),
+        compactionStarted("c2", 6),
+        compactionEnded(
+          "c2",
+          checkpoint(oneBigStep, 6),
+        ),
+        baseline(),
+        ...answers("a2", "The expectation is wrong: 1 + 1 is 2.", 1300),
+        executionSucceeded("exe_2"),
+      ],
+      expect: { history: ["c2", "a1", "s1", "u2", "a2"], execution: null },
+    },
+  ],
+}
+
+export const crashedCompaction: Scenario = {
+  title: "The process dies during a compaction",
+  description:
+    "The process dies after `compaction.started` and before the summary arrived. At the next start, recovery closes the compaction as crashed and takes the execution up again (which counts as a crash resume). No step was cut short, so there is no marker. History is what it was, the loop decides again from stored state, finds the request as large as before and compacts again, under a new compaction message.",
+  provider: "the first step is measured at 6,000 input tokens; the process dies before the summary call returns; after the restart the summary call returns a summary and the model answers",
+  contextWindow: WINDOW,
+  phases: [
+    {
+      label: "the process dies with the compaction open",
+      events: [...oneBigStep, compactionStarted("c1", 6)],
+      expect: { open: "c1", execution: { status: "running", crashResumes: 0 } },
+    },
+    {
+      label: "at the next start: recovery closes it, and the loop compacts again",
+      events: [
+        // The process died before the summary request was sent: the ledger has no call for it.
+        compactionFailed("c1", { kind: "crashed" }, 0),
+        executionResumed(),
+        compactionStarted("c2", 6),
+        compactionEnded("c2", checkpoint(oneBigStep, 6, SUMMARY, true)),
+        baseline(),
+        ...answers("a2", "The expectation is wrong: 1 + 1 is 2.", 1300),
+        executionSucceeded(),
+      ],
+      expect: {
+        ui: [{ id: "u1" }, { id: "a1" }, { id: "c1", kind: "compaction", status: "failed", error: "crashed" }, { id: "c2", kind: "compaction", status: "completed" }, { id: "a2" }],
+        history: ["c2", "a1", "a2"],
+        execution: null,
+      },
+    },
+  ],
+}
+
+// ---------------------------------------------------------------- the task list
+
+/** The list the model keeps in the scenario, as it sends it and as the tool confirms it. */
+export const TODO_ITEMS = [
+  { text: "Read the failing test", status: "done" },
+  { text: "Fix the expectation", status: "in_progress" },
+  { text: "Run the tests", status: "pending" },
+] as const
+export const TODO_INPUT = JSON.stringify({ todos: TODO_ITEMS })
+export const TODO_CONFIRMATION = "Task list updated: 1 done, 1 in progress, 1 pending.\nNow: Fix the expectation"
+
+const listTurn = [
+  ...opening(),
+  stepStarted("a1"),
+  called("a1", "call_1", "todo", TODO_INPUT),
+  event("tool.started", { messageId: m("a1"), callId: c("call_1"), effect: "read" }),
+  event("tool.settled", { messageId: m("a1"), callId: c("call_1"), outcome: "success", output: TODO_CONFIRMATION, truncation: null, attachments: [], display: { todo: { items: TODO_ITEMS.map((item) => ({ ...item })), counts: todoList(TODO_ITEMS).counts } } }),
+  stepEndedAt("a1", 4800, "tool_calls"),
+  ...answers("a2", "The expectation is wrong; fixing it is next.", 4900),
+  executionSucceeded(),
+]
+const listInput = [enqueue("u2", "Go on."), executionStarted("exe_2"), deliver("u2")]
+
+export const taskListSurvives: Scenario = {
+  title: "The model's task list survives a compaction",
+  description:
+    "The model keeps a task list with the `todo` tool: every call sends the whole list, and the current list is whatever the latest successful call in the log says. The tool keeps no state and changes nothing in the workspace (its effect class is `read`), so the call takes no snapshot and asks nobody. When the conversation is compacted, the call that set the list is among what the checkpoint replaces, and the model would no longer see its own list. So the checkpoint carries it: after the summary, the list as that call left it, one item per line. It is frozen in `compaction.ended` with the rest of the checkpoint. A client that folds the log still finds the list in the call's `display`.",
+  provider: "turn 1: a step that sets a three-item list (measured at 4,800 input tokens), then a step that answers (4,900); the summary call returns a summary; turn 2 answers",
+  contextWindow: WINDOW,
+  features: { todo: true },
+  phases: [
+    {
+      label: "the model sets its list and answers; the request is over the early threshold",
+      events: listTurn,
+      expect: { history: ["u1", "a1", "a2"], execution: null },
+    },
+    {
+      label: "the next message: the compaction's checkpoint carries the list, and the model goes on from it",
+      events: [...listInput, compactionStarted("c1", 17), compactionEnded("c1", checkpoint([...listTurn, ...listInput], 17)), baseline(), ...answers("a3", "Fixed the expectation; running the tests is next.", 1200), executionSucceeded("exe_2")],
+      expect: {
+        ui: [{ id: "u1" }, { id: "a1" }, { id: "a2" }, { id: "u2" }, { id: "c1", kind: "compaction", status: "completed" }, { id: "a3" }],
+        history: ["c1", "u2", "a3"],
+        execution: null,
+      },
+    },
+  ],
+}
+
+// ---------------------------------------------------------------- on request
+
+const askedTurn = [...opening(), ...reads("a1", "a.test.ts", "expect(add(1, 1)).toBe(3)", 3000), ...answers("a2", "The expectation is wrong: 1 + 1 is 2.", 3200), executionSucceeded()]
+
+export const onRequest: Scenario = {
+  title: "The user asks for a compaction while the session is idle",
+  description:
+    "The request is far below the thresholds, so nothing would be compacted by itself; the user asks for it (`/compact`). A compaction changes history, and history changes under a claim: the session takes one for this alone. `compaction.started` records `manual` as the trigger, and from there it is the compaction of every other scenario: the same summary request, the same repair and fallback, the same checkpoint. It keeps word for word only what the next request has to answer (here the model's last answer) and a short recent tail. Then the execution ends, with no step and no check: there was no turn, so nothing of a turn's to verify. The baseline is set again when the next turn is about to send a step. Asked again right away, the engine answers that there is nothing to compact and writes nothing; asked while a turn runs, the same compaction is made at the boundary after the step in progress.",
+  provider: "the turn is measured at 3,000 and 3,200 input tokens; the summary call returns a summary; the next turn answers",
+  contextWindow: WINDOW,
+  phases: [
+    {
+      label: "a turn, far below the thresholds",
+      events: askedTurn,
+      expect: { history: ["u1", "a1", "a2"], execution: null },
+    },
+    {
+      label: "the user asks: a claim of its own, the compaction, and the claim is released",
+      events: [executionStarted("exe_2"), compactionStarted("c1", 11, "manual"), compactionEnded("c1", checkpoint(askedTurn, 11)), executionSucceeded("exe_2")],
+      expect: { ui: [{ id: "u1" }, { id: "a1" }, { id: "a2" }, { id: "c1", kind: "compaction", status: "completed" }], history: ["c1", "a2"], execution: null },
+      rejects: [{ event: compactionStarted("c2", 11, "manual"), code: "invalid_transition", why: "no execution is running: a compaction is written under a claim" }],
+    },
+    {
+      label: "the next turn: the baseline is set again, and the request is the checkpoint, the kept answer and the new message",
+      events: [enqueue("u2", "Then fix it."), executionStarted("exe_3"), baseline(), deliver("u2"), ...answers("a3", "Changed the expectation to 2.", 1200), executionSucceeded("exe_3")],
+      expect: { history: ["c1", "a2", "u2", "a3"], execution: null },
+    },
+  ],
+}
+
+// ---------------------------------------------------------------- images
+
+/** The bytes of a scenario's image file: a stand-in, never decoded. */
+export const imageBytes = (path: string) => new TextEncoder().encode(`PNG ${path}`)
+/** The reference a tool's result carries for it: the SHA-256 of the bytes, as the blob store names them. */
+export const imageBlob = (path: string): BlobRef => ({ hash: createHash("sha256").update(imageBytes(path)).digest("hex"), mediaType: "image/png" })
+/** What the `read` tool says about an image file it attached, and what it reports for a client. */
+export const imageOutput = (path: string) => `${path}: PNG image (image/png), 640x480 pixels, ${imageBytes(path).length} bytes, attached.`
+export const imageDisplay = (path: string) => ({ path, image: { mediaType: "image/png", width: 640, height: 480, bytes: imageBytes(path).length } })
+/** One step that reads an image file, measured at `inputTokens`: its result carries the image. Five events. */
+const readsImage = (id: string, path: string, inputTokens: number) => [
+  stepStarted(id),
+  called(id, "call_1", "read", JSON.stringify({ path })),
+  toolStarted(id, "call_1", "read"),
+  event("tool.settled", { messageId: m(id), callId: c("call_1"), outcome: "success", output: imageOutput(path), truncation: null, attachments: [imageBlob(path)], display: imageDisplay(path) }),
+  stepEndedAt(id, inputTokens, "tool_calls"),
+]
+/** The line that follows the stored output of a result whose image a compaction retired, as the loop freezes it. */
+export const RETIRED_NOTE = (path: string) =>
+  `\n[The image of this result is no longer attached: it was taken out of the conversation when it was compacted, to save context. To see it again, read ${path} again.]`
+
+/** The window of the scenario about images: large enough for a compaction to keep three steps word for word. */
+export const IMAGE_WINDOW = 32_000
+const screenshots = [
+  ...opening("Compare the four screenshots."),
+  ...readsImage("a1", "one.png", 9000),
+  ...readsImage("a2", "two.png", 12000),
+  ...readsImage("a3", "three.png", 15000),
+  ...readsImage("a4", "four.png", 25000),
+]
+const retiredTwo = [{ messageId: m("a2"), callId: c("call_1"), images: 1, note: RETIRED_NOTE("two.png") }]
+
+export const imagesRetired: Scenario = {
+  title: "Old images are retired at a compaction, and at no other time",
+  description:
+    "A tool result may carry an image (the `read` tool on an image file, an MCP result), and it is sent again with every later request. An image that was sent is never dropped by itself: the block that holds it would change, and the provider's prompt cache would be lost for everything after it. So images are retired where the prefix is rebuilt anyway. Here one turn reads four screenshots and the next request is over the trigger. The compaction keeps the last three steps word for word. The first step is before the cut: nothing of it is sent any more, and the checkpoint lists its image (the file, its type and size) with the sentence that reading the file again shows it again. Of the kept results, the last step's image stays, because the model has not been shown it yet, and so does the one before it (the two most recent stay); the oldest kept result keeps its stored text and loses its image, and one line is appended that says so and how to see it again. `compaction.ended` records that (`retired`: the result, how many images, the line, frozen), and every request from then on is built from the record: the turn's answer and the next turn extend the request after the compaction block for block.",
+  provider: "the four reading steps are measured at 9,000, 12,000, 15,000 and 25,000 input tokens, and each result carries an image; the summary call returns a summary; the model then answers, and answers the next message",
+  contextWindow: IMAGE_WINDOW,
+  phases: [
+    {
+      label: "four steps, each with an image in its result; after the fourth the next request is over the trigger",
+      events: screenshots,
+      expect: { history: ["u1", "a1", "a2", "a3", "a4"], open: null },
+    },
+    {
+      label: "compact between two steps: three steps are kept, and the oldest of them loses its image",
+      events: [compactionStarted("c1", 11), event("compaction.ended", { messageId: m("c1"), summary: checkpoint(screenshots, 11, SUMMARY, true), source: "model", detail: null, tokensAfter: 0, usage: null, calls: 1, retired: retiredTwo }), baseline()],
+      expect: { history: ["c1", "a2", "a3", "a4"], open: null, execution: { status: "running", crashResumes: 0 } },
+    },
+    {
+      label: "the turn carries on, and so does the next one: nothing about the images changes between compactions",
+      events: [
+        ...answers("a5", "The second and the third differ in the header; the fourth has the dialog open.", 5000),
+        executionSucceeded(),
+        enqueue("u2", "Which one has the dialog?"),
+        executionStarted("exe_2"),
+        deliver("u2"),
+        ...answers("a6", "four.png.", 5200),
+        executionSucceeded("exe_2"),
+      ],
+      expect: {
+        ui: [{ id: "u1" }, { id: "a1" }, { id: "a2" }, { id: "a3" }, { id: "a4" }, { id: "c1", kind: "compaction", status: "completed" }, { id: "a5" }, { id: "u2" }, { id: "a6" }],
+        history: ["c1", "a2", "a3", "a4", "a5", "u2", "a6"],
+        execution: null,
+      },
+    },
+  ],
+}
+
+/** The same compaction with a record the reducer does not accept, for the scenario's wrong moves. */
+const endedRetiring = (retired: readonly { messageId: ReturnType<typeof m>; callId: ReturnType<typeof c>; images: number; note: string }[]) =>
+  event("compaction.ended", { messageId: m("c1"), summary: checkpoint(screenshots, 11, SUMMARY, true), source: "model", detail: null, tokensAfter: 0, usage: null, calls: 1, retired: [...retired] })
+
+export const imagesRetiredWrongly: Scenario = {
+  title: "What a compaction may not record about images",
+  description:
+    "The record of retired images is what every later request is built from, so the reducer accepts only what can be rendered: a result among the messages the compaction keeps, that is settled and carries exactly the number of images the record says, named once. A result before the cut is not sent at all and has nothing to retire; a result without an image has nothing to lose.",
+  provider: "as in the scenario before: four reading steps with an image each, then the summary call",
+  contextWindow: IMAGE_WINDOW,
+  phases: [
+    {
+      label: "the compaction is open, with the cut before the second step",
+      events: [...screenshots, compactionStarted("c1", 11)],
+      expect: { open: "c1", history: ["u1", "a1", "a2", "a3", "a4"] },
+      rejects: [
+        { event: endedRetiring([{ messageId: m("a1"), callId: c("call_1"), images: 1, note: RETIRED_NOTE("one.png") }]), code: "invalid_transition", why: "the first step is before the cut: it is not sent any more, so nothing of it is retired" },
+        { event: endedRetiring([{ messageId: m("a2"), callId: c("call_1"), images: 2, note: RETIRED_NOTE("two.png") }]), code: "invalid_transition", why: "the result carries one image, not two" },
+        { event: endedRetiring([...retiredTwo, ...retiredTwo]), code: "invalid_transition", why: "a result is retired once" },
+        { event: endedRetiring([{ messageId: m("u1"), callId: c("call_1"), images: 1, note: RETIRED_NOTE("one.png") }]), code: "invalid_transition", why: "only a step has results" },
+      ],
+    },
+    {
+      label: "the compaction ends with a record the reducer accepts, and the turn carries on",
+      events: [endedRetiring(retiredTwo), baseline(), ...answers("a5", "The fourth has the dialog open.", 5000), executionSucceeded()],
+      expect: { history: ["c1", "a2", "a3", "a4", "a5"], execution: null },
+    },
+  ],
+}
+
+export const compactionScenarios = [
+  atUserBoundary,
+  midTurn,
+  contextOverflow,
+  ineffective,
+  summaryRepaired,
+  summaryFallback,
+  interruptedCompaction,
+  crashedCompaction,
+  taskListSurvives,
+  onRequest,
+  imagesRetired,
+  imagesRetiredWrongly,
+]

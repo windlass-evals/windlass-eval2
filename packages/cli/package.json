@@ -1,0 +1,21 @@
+{
+  "name": "@windlass/cli",
+  "version": "0.0.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "windlass": "./src/main.ts",
+    "wl": "./src/main.ts"
+  },
+  "exports": {
+    ".": "./src/main.ts",
+    "./engine": "./src/engine.ts"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "2.5.0",
+    "@windlass/core": "workspace:*",
+    "@windlass/acp": "workspace:*",
+    "@windlass/tui": "workspace:*"
+  }
+}

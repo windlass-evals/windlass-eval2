@@ -1,0 +1,7 @@
+{
+  "cart.heading": "Ihr Warenkorb",
+  "checkout.heading": "Kasse",
+  "checkout.pay": "{amount} bezahlen",
+  "orders.heading": "Ihre Bestellungen",
+  "orders.none": "Sie haben noch nichts bestellt."
+}

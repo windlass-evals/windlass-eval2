@@ -1,0 +1,19 @@
+{
+  "name": "@windlass/core",
+  "version": "0.0.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./auth/chatgpt": "./src/auth/chatgpt.ts",
+    "./store/sqlite": "./src/store/sqlite.ts",
+    "./provider/openai-responses": "./src/provider/openai-responses.ts",
+    "./request": "./src/request/index.ts",
+    "./instructions": "./src/instructions/index.ts",
+    "./tools": "./src/tools/index.ts",
+    "./engine": "./src/engine/index.ts",
+    "./testing": "./src/testing/index.ts",
+    "./testing/scenarios": "./test/scenarios/index.ts"
+  }
+}

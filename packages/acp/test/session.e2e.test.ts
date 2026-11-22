@@ -1,0 +1,208 @@
+import { afterEach, expect, test, setDefaultTimeout } from "bun:test"
+import { join } from "node:path"
+import { methods } from "@agentclientprotocol/sdk"
+import { ACCESS_TOKEN_FILE_ENV, FAILURE_TEXT, brand } from "@windlass/core"
+import { HANDED_IN_REJECTED, HAND_IN_ADVICE } from "@windlass/core/auth/chatgpt"
+import { E2E_TIMEOUT_MS, script } from "@windlass/core/testing"
+import { SIGN_IN_HINT } from "../src/server.ts"
+import { EXT, META } from "../src/extensions.ts"
+import { type Harness, startHarness } from "./helpers.ts"
+
+// End-to-end: real processes start here, so each test has a limit sized for a slow runner.
+setDefaultTimeout(E2E_TIMEOUT_MS)
+
+const harnesses: Harness[] = []
+afterEach(async () => {
+  const violations = harnesses.flatMap((harness) => harness.violations)
+  for (const harness of harnesses.splice(0).reverse()) await harness.close()
+  expect(violations).toEqual([])
+})
+
+async function start(options: Parameters<typeof startHarness>[0] = {}) {
+  const harness = await startHarness(options)
+  harnesses.push(harness)
+  await harness.initialize()
+  return harness
+}
+
+test("session/load replays the stored history as updates, then reports the current state", async () => {
+  const first = await start({
+    responses: [
+      [script.reasoning("Check the file."), script.text("Let me look."), script.toolCall("call_1", "read", { path: "a.txt" })],
+      [script.text("It says hi."), script.usage({ inputTokens: 50, cachedInputTokens: 10, outputTokens: 5 })],
+    ],
+  })
+  await Bun.write(join(first.workspace, "a.txt"), "hi\n")
+  const sessionId = await first.newSession()
+  await first.connection.agent.request(methods.agent.session.prompt, { sessionId, prompt: [{ type: "text", text: "read a.txt" }] })
+  const live = first.of(sessionId).filter((update) => ["agent_message_chunk", "agent_thought_chunk"].includes(update.sessionUpdate))
+  await first.disconnect()
+  await first.backend.close()
+
+  const second = await start({ dataDir: first.dataDir })
+  const response = await second.connection.agent.request(methods.agent.session.load, { sessionId, cwd: first.workspace, mcpServers: [] })
+  expect(response.configOptions?.map((option) => option.currentValue)).toEqual(["test-model", "default", "auto"])
+  const replayed = second.of(sessionId)
+  expect(replayed.map((update) => update.sessionUpdate)).toEqual([
+    "user_message_chunk",
+    "agent_thought_chunk",
+    "agent_message_chunk",
+    "tool_call",
+    "tool_call_update",
+    "tool_call_update",
+    "agent_message_chunk",
+    "session_info_update",
+    "usage_update",
+  ])
+  expect(replayed[0]).toMatchObject({ content: { type: "text", text: "read a.txt" } })
+  // Whole items on replay, under the same message IDs as live.
+  const text = (update: unknown) => (update as { messageId: string; content: { text: string } })
+  const join_ = (updates: unknown[]) => {
+    const byId = new Map<string, string>()
+    for (const update of updates) byId.set(text(update).messageId, (byId.get(text(update).messageId) ?? "") + text(update).content.text)
+    return [...byId]
+  }
+  expect(join_(replayed.filter((update) => ["agent_message_chunk", "agent_thought_chunk"].includes(update.sessionUpdate)))).toEqual(join_(live))
+  expect(replayed[5]).toMatchObject({ status: "completed" })
+  expect(replayed.at(-1)).toEqual({ sessionUpdate: "usage_update", used: 55, size: 200_000 })
+  // The replay is complete before the response.
+  const responseIndex = second.wire.findIndex((message) => "result" in message && (message.result as Record<string, unknown>).configOptions !== undefined)
+  const lastUpdate = second.wire.findLastIndex((message) => message.method === "session/update")
+  expect(lastUpdate).toBeLessThan(responseIndex)
+  expect(second.ext.filter((note) => note.method === EXT.state).map((note) => note.params.state)).toEqual(["idle"])
+
+  // Resume does not replay.
+  const third = await start({ dataDir: first.dataDir })
+  await second.disconnect()
+  await second.backend.close()
+  await third.connection.agent.request(methods.agent.session.resume, { sessionId, cwd: first.workspace })
+  expect(third.of(sessionId).map((update) => update.sessionUpdate)).toEqual(["session_info_update", "usage_update"])
+})
+
+test("session/list, session/close and session/delete (a soft delete: the session is archived, its log stays)", async () => {
+  const harness = await start({ responses: [[script.text("one")], [script.text("two")]] })
+  const a = await harness.newSession()
+  const b = await harness.newSession()
+  await harness.connection.agent.request(methods.agent.session.prompt, { sessionId: a, prompt: [{ type: "text", text: "first" }] })
+  const listed = await harness.connection.agent.request(methods.agent.session.list, { cwd: harness.workspace })
+  expect(listed.sessions.map((session) => session.sessionId).sort()).toEqual([a, b].sort())
+  expect(listed.sessions.every((session) => session.cwd === harness.workspace && typeof session.updatedAt === "string")).toBe(true)
+  expect((await harness.connection.agent.request(methods.agent.session.list, { cwd: "/elsewhere" })).sessions).toEqual([])
+
+  await harness.connection.agent.request(methods.agent.session.close, { sessionId: b })
+  await expect(harness.connection.agent.request(methods.agent.session.prompt, { sessionId: b, prompt: [{ type: "text", text: "x" }] })).rejects.toMatchObject({ code: -32002 })
+  await harness.connection.agent.request(methods.agent.session.close, { sessionId: "ses_unknown" })
+
+  await harness.connection.agent.request(methods.agent.session.delete, { sessionId: a })
+  expect((await harness.connection.agent.request(methods.agent.session.list, {})).sessions.map((session) => session.sessionId)).toEqual([b])
+  await expect(harness.connection.agent.request(methods.agent.session.load, { sessionId: a, cwd: harness.workspace, mcpServers: [] })).rejects.toMatchObject({ code: -32002 })
+  // The log is still there.
+  expect(harness.backend.engine.readEvents(a as never).map((item) => item.type).at(-1)).toBe("session.archived")
+  // Loading a session from another directory is refused rather than run in the wrong place.
+  await expect(harness.connection.agent.request(methods.agent.session.load, { sessionId: b, cwd: "/tmp", mcpServers: [] })).rejects.toMatchObject({ code: -32602 })
+})
+
+test("signed out: session creation fails with auth-required and says how to sign in", async () => {
+  const harness = await start({ signIn: async () => ({ signedIn: false, message: `Not signed in. To sign in, ${SIGN_IN_HINT}.` }) })
+  const init = (harness.wire[0] as { result: { authMethods: { id: string }[] } }).result
+  expect(init.authMethods.map((method) => method.id)).toEqual(["chatgpt"])
+  const attempt = harness.connection.agent.request(methods.agent.session.new, { cwd: harness.workspace, mcpServers: [] })
+  await expect(attempt).rejects.toMatchObject({ code: -32000 })
+  const error = (await attempt.catch((caught: unknown) => caught)) as { message: string }
+  expect(error.message).toContain(`${brand.binary} login`)
+  await expect(harness.connection.agent.request(methods.agent.authenticate, { methodId: "chatgpt" })).rejects.toMatchObject({ code: -32000 })
+  await expect(harness.connection.agent.request(methods.agent.session.load, { sessionId: "ses_x", cwd: harness.workspace, mcpServers: [] })).rejects.toMatchObject({ code: -32000 })
+})
+
+test("a failed turn answers the prompt with an error that says why; signed out mid-session is auth-required", async () => {
+  const harness = await start({
+    responses: [[script.fail("invalid_request", { message: "The request was malformed: bad tool schema." })], [script.fail("auth", { message: "token rejected" })]],
+    engine: { refreshAuth: async () => false },
+  })
+  const sessionId = await harness.newSession()
+  const failed = harness.connection.agent.request(methods.agent.session.prompt, { sessionId, prompt: [{ type: "text", text: "go" }] })
+  await expect(failed).rejects.toMatchObject({ code: -32603, message: "The request was malformed: bad tool schema." })
+  expect(harness.ext.filter((note) => note.method === EXT.state).at(-1)?.params).toMatchObject({ state: "idle", stopReason: "error" })
+  const signedOut = harness.connection.agent.request(methods.agent.session.prompt, { sessionId, prompt: [{ type: "text", text: "again" }] })
+  await expect(signedOut).rejects.toMatchObject({ code: -32000 })
+  expect(((await signedOut.catch((caught: unknown) => caught)) as { message: string }).message).toContain("Signed out")
+})
+
+test("a failed turn's error data carries the provider error's code when it has one, and no code when it has none", async () => {
+  const harness = await start({
+    responses: [[script.fail("transport", { message: "no usable access token: Could not reach the sign-in service at auth.example.test: the request failed", code: "network_error" })], [script.fail("invalid_request", { message: "The request was malformed." })]],
+    // One attempt: the backoff between attempts is not what is tested.
+    engine: { limits: { attemptBudget: 1 } },
+  })
+  const sessionId = await harness.newSession()
+  const data = async (text: string) => {
+    const failed = harness.connection.agent.request(methods.agent.session.prompt, { sessionId, prompt: [{ type: "text", text }] })
+    return ((await failed.catch((caught: unknown) => caught)) as { code: number; data: Record<string, unknown> }).data
+  }
+  expect(await data("go")).toEqual({ [META.capabilities]: { reason: "execution_failed", providerError: "transport", code: "network_error" } })
+  expect(await data("again")).toEqual({ [META.capabilities]: { reason: "execution_failed", providerError: "invalid_request" } })
+})
+
+test("a sign-in handed in from outside: auth-required says to hand in a new token, and never to sign in on this machine", async () => {
+  const saved = process.env[ACCESS_TOKEN_FILE_ENV]
+  // Never opened here: the state of the sign-in and the model's answers are given.
+  process.env[ACCESS_TOKEN_FILE_ENV] = "/run/handed-in/token"
+  try {
+    const unusable = `The file ${ACCESS_TOKEN_FILE_ENV} names does not exist (/run/handed-in/token). ${HAND_IN_ADVICE}`
+    const signedOut = await start({ signIn: async () => ({ signedIn: false, message: unusable, code: "handed_in_missing" }) })
+    const method = (signedOut.wire[0] as { result: { authMethods: { id: string; description: string }[] } }).result.authMethods[0]!
+    expect(method.id).toBe("chatgpt")
+    expect(method.description).toBe(`Uses the access token of a ChatGPT plan sign-in held elsewhere, handed in through ${ACCESS_TOKEN_FILE_ENV}. ${HAND_IN_ADVICE}`)
+    // Which failure it is travels as a code beside the sentence, so that a client need not read the sentence.
+    const refused = { code: -32000, message: `Authentication required: ${unusable}`, data: { methodId: "chatgpt", [META.capabilities]: { reason: "auth_required", message: unusable, code: "handed_in_missing" } } }
+    await expect(signedOut.connection.agent.request(methods.agent.session.new, { cwd: signedOut.workspace, mcpServers: [] })).rejects.toMatchObject(refused)
+    await expect(signedOut.connection.agent.request(methods.agent.authenticate, { methodId: "chatgpt" })).rejects.toMatchObject(refused)
+    await expect(signedOut.connection.agent.request(methods.agent.session.load, { sessionId: "ses_x", cwd: signedOut.workspace, mcpServers: [] })).rejects.toMatchObject(refused)
+
+    // A token the provider turns down in the middle of a session, still turned down when it is read again.
+    const turnedDown = script.fail("auth", { message: "HTTP 401: Unauthorized", status: 401, code: HANDED_IN_REJECTED })
+    const noToken = script.fail("auth", { message: `no usable access token: ${unusable}`, code: "handed_in_expired" })
+    // Each failure twice: a rejected sign-in is looked up once more before the step fails.
+    const rejected = await start({ responses: [[turnedDown], [turnedDown], [noToken], [noToken]], engine: { refreshAuth: async () => true } })
+    await expect(rejected.connection.agent.request(methods.agent.authenticate, { methodId: "chatgpt" })).resolves.toEqual({})
+    const sessionId = await rejected.newSession()
+    const prompt = rejected.connection.agent.request(methods.agent.session.prompt, { sessionId, prompt: [{ type: "text", text: "go" }] })
+    await expect(prompt).rejects.toMatchObject({ code: -32000, message: `Authentication required: ${FAILURE_TEXT.handedInRejected}` })
+    // The turn's sentence is the same for a token the provider rejected and for a file that gives none; the code is not.
+    const data = async (request: Promise<unknown>) => ((await request.catch((caught: unknown) => caught)) as { data: Record<string, unknown> }).data
+    expect(await data(prompt)).toEqual({ methodId: "chatgpt", [META.capabilities]: { reason: "auth_required", message: FAILURE_TEXT.handedInRejected, code: "handed_in_rejected" } })
+    const expired = rejected.connection.agent.request(methods.agent.session.prompt, { sessionId, prompt: [{ type: "text", text: "again" }] })
+    expect(await data(expired)).toEqual({ methodId: "chatgpt", [META.capabilities]: { reason: "auth_required", message: FAILURE_TEXT.handedInRejected, code: "handed_in_expired" } })
+    for (const message of [unusable, FAILURE_TEXT.handedInRejected, method.description]) {
+      expect(message).toContain(ACCESS_TOKEN_FILE_ENV)
+      expect(message).not.toContain(SIGN_IN_HINT)
+      expect(message).not.toContain("sign in again")
+    }
+  } finally {
+    if (saved === undefined) delete process.env[ACCESS_TOKEN_FILE_ENV]
+    else process.env[ACCESS_TOKEN_FILE_ENV] = saved
+  }
+})
+
+test("a session another process works in is listed and refused, with the process named; once it is closed there it loads", async () => {
+  const first = await start({ responses: [[script.text("Hello.")]] })
+  const sessionId = await first.newSession()
+  await first.connection.agent.request(methods.agent.session.prompt, { sessionId, prompt: [{ type: "text", text: "hi" }] })
+  // A second server on the same data directory: another editor window, or a terminal next to the editor.
+  const second = await start({ dataDir: first.dataDir, responses: [[script.text("Hello again.")]] })
+  expect((await second.connection.agent.request(methods.agent.session.list, {})).sessions.map((session) => session.sessionId)).toEqual([sessionId])
+  const load = () => second.connection.agent.request(methods.agent.session.load, { sessionId, cwd: first.workspace, mcpServers: [] })
+  const refused = await load().catch((error: unknown) => error)
+  expect(refused).toMatchObject({ code: -32603, data: { [META.capabilities]: { reason: "session_in_use", holderPid: process.pid } } })
+  expect((refused as Error).message).toContain(`session ${sessionId} is in use`)
+  // Closing it in the first server closes that session only: the first server still makes new ones.
+  await first.connection.agent.request(methods.agent.session.close, { sessionId })
+  const other = await first.newSession()
+  expect(other).not.toBe(sessionId)
+  await load()
+  // The second server replayed the stored log and now works in it.
+  expect(second.of(sessionId, "agent_message_chunk").length).toBeGreaterThan(0)
+  expect((await second.connection.agent.request(methods.agent.session.prompt, { sessionId, prompt: [{ type: "text", text: "again" }] })).stopReason).toBe("end_turn")
+  // And now the first is the one that is refused.
+  await expect(first.connection.agent.request(methods.agent.session.load, { sessionId, cwd: first.workspace, mcpServers: [] })).rejects.toMatchObject({ code: -32603 })
+})

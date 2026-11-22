@@ -1,0 +1,328 @@
+/**
+ * The tool contract. The runtime that validates input, runs tools in parallel
+ * and caps output belongs to the tool track; this file fixes only what a tool
+ * is, what it is given and what it returns.
+ */
+import type { BlobRef } from "../content.ts"
+import type { CallId, MessageId, SessionId } from "../id.ts"
+import type { Json } from "../json.ts"
+import { type Infer, integer, json, nonEmptyString, nullable, object, oneOf, string } from "../validate.ts"
+
+/**
+ * What the model is told about a tool. This is the part that enters the
+ * request, is hashed as a `tool` block and is frozen in the session baseline.
+ * `inputSchema` is a JSON Schema object describing the tool's input.
+ */
+export const toolSpec = object({ name: nonEmptyString, description: string, inputSchema: json })
+export type ToolSpec = Infer<typeof toolSpec>
+
+/**
+ * The strongest thing a tool can do. Sandbox and approval decisions are made
+ * from this class, never from the tool's name.
+ * - `read`: observes the workspace; no side effect.
+ * - `write`: changes files in the workspace.
+ * - `exec`: runs arbitrary processes.
+ * - `network`: talks to something outside the machine.
+ *
+ * A call that was started with any effect other than `read` and whose outcome
+ * was not observed is settled as `effect_unknown`.
+ */
+export const toolEffect = oneOf(["read", "write", "exec", "network"])
+export type ToolEffect = Infer<typeof toolEffect>
+
+/** Where a tool comes from (`Tool.origin`). */
+export type ToolOrigin = "builtin" | "mcp" | "host"
+
+/** Recorded when the model-facing output is shorter than what the tool produced. */
+export const truncation = object({
+  /** Size of the full output before capping. */
+  originalBytes: integer(0),
+  originalLines: integer(0),
+  /** Where the full output was written, when it was spilled to a file. */
+  spillPath: nullable(string),
+})
+export type Truncation = Infer<typeof truncation>
+
+/** Ephemeral progress from a running tool, for display only. It is never stored and never sent to the model. */
+export interface ToolProgress {
+  /** Replaces the previous progress text for this call, e.g. the tail of a running command's output. */
+  readonly text: string
+}
+
+/**
+ * How the approval layer decided a command runs: inside the OS sandbox, with
+ * the network when `network`, and with `writableRoots` writable besides the
+ * workspace and the temp directory.
+ */
+export interface SandboxRun {
+  readonly network: boolean
+  readonly writableRoots: readonly string[]
+}
+
+/**
+ * One piece of a text as the harness redacts it: a marker (`kind` is set) that
+ * stands for `original`, or text left as it is. The `original`s joined are the
+ * input; the `text`s joined are what the model is shown.
+ */
+export interface RedactedText {
+  readonly text: string
+  readonly original: string
+  readonly kind: string | null
+}
+
+/**
+ * The session's private temp directory. Sandboxed commands may write it; on
+ * Linux they see it as `alias` (`/tmp`), and the file tools read a path under
+ * `alias` as the same file, so a command and a tool mean one place by one name.
+ */
+export interface TempDirectory {
+  readonly dir: string
+  readonly alias: string | null
+}
+
+/** A command a tool started that outlives the tool's call, as it hands it to the session. */
+export interface BackgroundCommand {
+  readonly command: string
+  /** Where its whole output is written as it arrives. */
+  readonly logPath: string | null
+  /** Stops it (the whole process group) and resolves once it is gone. */
+  readonly stop: () => Promise<void>
+  /** Its output so far, capped for the model. */
+  readonly output: () => string
+  /**
+   * Its output a line at a time, for a watch: `listener` is called at once
+   * with each complete line that is still in memory (the most recent
+   * output, oldest first), then with each further line when it is complete,
+   * and with a last line that has no line break when the command ends.
+   * Lines are what the log holds (redacted when the output is), without
+   * their line break, and a very long line is cut. Returns the function
+   * that stops the calls. A listener must not throw. Absent where a
+   * command's output cannot be followed.
+   */
+  readonly lines?: (listener: (line: string) => void) => () => void
+  /** Resolves when it is gone, however it ended. */
+  readonly exited: Promise<{ readonly exitCode: number | null; readonly signal: string | null; readonly timedOut: boolean; readonly durationMs: number; readonly output: string }>
+}
+
+/**
+ * What a tool is given to start work that outlives its call. The session
+ * records the work durably, stops it when the session is interrupted or
+ * closed, and tells the model when it ends.
+ */
+export interface BackgroundHost {
+  /** Registers a command that was just spawned. Returns the handle the model refers to it by. */
+  readonly command: (work: BackgroundCommand) => { readonly id: string }
+}
+
+/** Everything a tool is given besides its input. */
+export interface ToolContext {
+  readonly sessionId: SessionId
+  /** The assistant message that made the call. With `callId` it identifies the call. */
+  readonly messageId: MessageId
+  /** The provider's call ID. Not unique on its own. */
+  readonly callId: CallId
+  /** Absolute working directory of the session. Relative paths in the input resolve against it. */
+  readonly cwd: string
+  /**
+   * Aborted when the execution is interrupted, or when the user stops this
+   * call and nothing else. It is the call's own (`createCallStop`), so
+   * `callStopReasonOf(signal)` gives the reason: `user` or `shutdown` for an
+   * interrupt, `call` for a stop of this call, after which the step carries
+   * on and the model reads the result. A tool must stop promptly and return
+   * what it observed so far rather than throw (a shell kills its process
+   * group, waits a bounded grace period, then returns the output so far, with
+   * a line that says who stopped it). A tool that cannot stop midway (a file
+   * read, a write that is one rename) finishes and returns its result as ever.
+   */
+  readonly signal: AbortSignal
+  /** Reports ephemeral progress. Safe to call often; may be dropped. */
+  readonly progress: (update: ToolProgress) => void
+  /**
+   * Stores bytes in the content-addressed blob table and returns the
+   * reference, which the tool then lists in `ToolResult.attachments` (a
+   * screenshot, a rendered image). Synchronous and idempotent, like
+   * `Store.putBlob`: the same bytes always give the same reference. The tool
+   * runtime supplies it from its options, so a tool never sees the store.
+   */
+  readonly putBlob: PutBlob
+  /**
+   * For a tool that runs processes. Absent or `null`: run the command as it
+   * is. Otherwise run it in the sandbox with this access, or, where that
+   * cannot be done, not at all: a tool never falls back to running unsandboxed.
+   */
+  readonly sandbox?: SandboxRun | null
+  /** The session's temp directory, when it has one. */
+  readonly temp?: TempDirectory
+  /**
+   * Where this call's output is written in full when it is too long for the
+   * model, instead of the directory the tool or the runtime was made with:
+   * a directory of the session's own that its sandboxed commands can read,
+   * so that the path the model is given works in a command too.
+   */
+  readonly spillDir?: string
+  /**
+   * The harness's redaction of tool output, for a tool that changes a file
+   * the model was shown redacted: it finds what a placeholder in the model's
+   * arguments stands for instead of writing the placeholder into the file.
+   */
+  readonly redact?: (text: string) => readonly RedactedText[]
+  /**
+   * With `redact`, for output that is still arriving: where the end of `text`
+   * may be the beginning of a secret value `redact` replaces only once it is
+   * whole (`unfinishedSecret` in `approval/redact.ts`), or `text.length`.
+   * A stream is redacted a line at a time (`tool/redact-stream.ts`); without
+   * this, a value with a line break in it is missed where the stream is cut
+   * between its lines.
+   */
+  readonly unfinishedSecret?: (text: string) => number
+  /** For a tool that can start work in the background. Absent where there is no session to own that work. */
+  readonly background?: BackgroundHost
+}
+
+/** Stores bytes under their SHA-256 and returns the reference. The signature of `Store.putBlob`. */
+export type PutBlob = (bytes: Uint8Array, mediaType: string) => BlobRef
+
+/**
+ * For a context built outside a session (a check runner, a unit test of a
+ * tool that returns no media): a `putBlob` that fails loudly instead of
+ * dropping the bytes.
+ */
+export const noBlobStore: PutBlob = () => {
+  throw new Error("this tool context has no blob store")
+}
+
+/**
+ * What a tool returns. The runtime turns it into the `tool.settled` event
+ * exactly once; from then on `output` is stored and replayed byte for byte and
+ * nothing may re-render or re-cap it (storage rule 4).
+ */
+export interface ToolResult {
+  /** `error` means the tool ran and failed; the model sees `output` as the error text. */
+  readonly status: "success" | "error"
+  /**
+   * The text for the model. If the tool capped it itself (for example a shell
+   * that kept only a head and tail while streaming to a spill file), it says so
+   * in `truncation` and the runtime must not cap again. If `truncation` is
+   * `null`, the runtime applies its cap once and fills `truncation` in.
+   */
+  readonly output: string
+  readonly truncation: Truncation | null
+  /** Media for the model, already stored in the blob table. */
+  readonly attachments: readonly BlobRef[]
+  /** Structured data for a UI (a diff, an exit code). Never sent to the model. */
+  readonly display: Json | null
+}
+
+/**
+ * A tool. `Input` is the shape `execute` receives after the runtime has
+ * validated the model's arguments against `inputSchema`; malformed or
+ * truncated arguments never reach `execute` (retry rule 6).
+ */
+export interface Tool<Input = Json> extends ToolSpec {
+  readonly effect: ToolEffect
+  /**
+   * Where the tool comes from. `mcp`: an MCP server provides it, so it runs
+   * outside the sandbox and its declared effect is not trusted: approval
+   * asks about it by name and its results taint the session. `host`: the
+   * client that opened the session declared it and runs it (`tools/host.ts`);
+   * it is decided by its declared effect, as a built-in tool is. Absent: built in.
+   */
+  readonly origin?: ToolOrigin
+  /**
+   * Runs the tool. Expected failures are returned as `status: "error"`. A
+   * thrown exception is a bug in the tool; the runtime settles the call as
+   * `error`, or as `effect_unknown` when `effect` is not `read`.
+   */
+  readonly execute: (input: Input, context: ToolContext) => Promise<ToolResult>
+  /**
+   * The files or directories a call with this input reads or writes, as the
+   * model gave them (absolute, or relative to the working directory). The
+   * step loop looks for instruction files (AGENTS.md) in the directories a
+   * session works in. A tool that names no path (a shell command) leaves it out.
+   */
+  readonly touches?: (input: Input) => readonly string[]
+  /**
+   * The tool hands its work to something that is decided on its own: a
+   * subagent, whose every call goes through the approval layer of its own
+   * session. Such a call needs no decision itself and runs side by side with
+   * the other calls of its step instead of waiting in the line of calls
+   * that can change something. Its effect class still says whether the step
+   * may have changed files.
+   */
+  readonly delegates?: boolean
+  /**
+   * The tool runs a program whose every effect is a call of other tools
+   * (`run_code`, `codemode/`). Each of those calls is a call of the step,
+   * nested under this one, and is decided, recorded and scheduled like any
+   * call; the program itself runs confined and can change nothing. So this
+   * call needs no question of its own: the approval layer only says how it
+   * runs (in the sandbox, with nothing writable and no network). For the
+   * schedule it is a call that changes something and names nothing: it
+   * waits for the response's earlier writes and commands, and the later ones
+   * wait for it, so the program's calls never run beside a command or a
+   * write of the response. Not part of the tool's spec.
+   */
+  readonly nests?: boolean
+  /**
+   * The result of a call depends on something that changes without any call
+   * of the model's: work that runs in the background, a clock, a server
+   * elsewhere. The same call made twice with the same result then says
+   * nothing about a third (a command that printed nothing new for a while is
+   * polled again), so the identical-call guard leaves the tool alone. Not
+   * part of the tool's spec.
+   */
+  readonly varies?: boolean
+  /**
+   * For a tool that stands for many (the MCP bridge, whose one `mcp_call`
+   * reaches every tool of every server): the name a call with this input is
+   * asked about and remembered by, e.g. `github/create_issue`. Without it
+   * that is the tool's own name. It is given the call's input (typed by the
+   * implementation) and must not throw on input the schema allows.
+   */
+  readonly subject?: (input: never) => string
+  /**
+   * What a call can change, where that is less than its effect class says.
+   * `records`: only records the harness keeps for itself (the wake-up store,
+   * the notes of memory, which are in the project's harness directory only
+   * when the user's own configuration puts them there): no file the project
+   * works with, and nothing leaves the machine. The class stays `write`, so a crash is still `effect_unknown`
+   * and the step is still bracketed by snapshots; the approval layer reads
+   * this and does not treat the call as a file write: it runs without a
+   * question in the modes `auto` and `full`, and mode `ask` asks about it
+   * as what it is. Not part of the tool's spec.
+   *
+   * A function answers for one call, where it depends on the input: a
+   * tool of class `exec` whose call runs nothing says so (`wake_create`
+   * for a timer or a webhook, which has no command), and that call is
+   * decided as a change of records and never as a command. It must not
+   * throw on input the schema allows; `null` means the class says it all.
+   */
+  readonly changes?: "records" | ((input: never) => "records" | null)
+  /**
+   * What the user should know about a call with this input before approving
+   * it, beyond what its class says: one fact per line, shown in the question
+   * (a wake-up says that its command runs later, unattended, and how often).
+   */
+  readonly cautions?: (input: never) => readonly string[]
+}
+
+/**
+ * A tool of any input type, for registries and the runtime. `Tool<{ path: string }>`
+ * is assignable to it. The runtime validates the model's arguments against
+ * `inputSchema` and then makes the one cast needed to call `execute`.
+ */
+export type AnyTool = Tool<never>
+
+/** Extracts the model-facing part of a tool. */
+export function specOf(tool: ToolSpec): ToolSpec {
+  return { name: tool.name, description: tool.description, inputSchema: tool.inputSchema }
+}
+
+/**
+ * Orders tools by name, comparing UTF-16 code units. The order is the same on
+ * every machine and locale (`localeCompare` is not), which the frozen tool list
+ * depends on (context rule 2).
+ */
+export function sortTools<T extends { readonly name: string }>(tools: readonly T[]): T[] {
+  return [...tools].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+}

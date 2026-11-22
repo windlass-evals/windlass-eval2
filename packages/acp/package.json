@@ -1,0 +1,17 @@
+{
+  "name": "@windlass/acp",
+  "version": "0.0.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./extensions": "./src/extensions.ts",
+    "./client": "./src/client.ts",
+    "./turns": "./src/turns.ts"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "2.5.0",
+    "@windlass/core": "workspace:*"
+  }
+}

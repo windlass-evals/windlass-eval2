@@ -1,0 +1,16 @@
+{
+  "name": "@windlass/tui",
+  "version": "0.0.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "2.5.0",
+    "@windlass/acp": "workspace:*",
+    "@windlass/core": "workspace:*",
+    "@opentui/core": "0.8.4"
+  }
+}

@@ -160,6 +160,10 @@ windlass --session ses_9acf "and run it"
   after its latest step, or after a turn with `--turn <n>` (1 is the session's first prompt; the full-screen interface
   shows each turn's number on its ending row, and `/fork <n>` does the same there). `windlass fork --help` has the precise
   form, an event number. Forking and listing need no sign-in.
+- `windlass export <session-id> > notes.md` writes the saved conversation as Markdown, with **User** and **Assistant**
+  headings. Use the full ID or a unique start of it. The export includes older messages kept on disk after compaction
+  but leaves out undone or refused turns, tool calls and results, and model reasoning. It shows slash commands as
+  typed, not as expanded for the model, and omits non-text attachments. It does not change the session or require sign-in.
 
 **Another version.** A version of Windlass opens every session an earlier one wrote. The other way round is not
 promised: a session a later version has recorded something new in is refused by an earlier one, whole, rather than

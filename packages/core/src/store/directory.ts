@@ -73,7 +73,7 @@ import { join } from "node:path"
 import { brand } from "../brand.ts"
 import type { StoredEvent } from "../event/durable.ts"
 import { type SessionId, sessionId as sessionIdValidator } from "../id.ts"
-import { sessionState } from "../message/message.ts"
+import { type Message, sessionState } from "../message/message.ts"
 import { type BlobStore, createFileBlobStore } from "./blobs.ts"
 import { SCHEMA_VERSION } from "./schema.ts"
 import { StoreLockedError, isBusy } from "./sqlite-lock.ts"
@@ -142,6 +142,47 @@ export interface SessionDirectory extends SessionStores {
 
 const SESSION_FILE = /^(.+)\.db$/
 
+function sessionPath(sessionsDir: string, id: SessionId): string {
+  // A session ID becomes a file name: nothing in it may leave the directory.
+  if (!/^[A-Za-z0-9_-]+$/.test(sessionIdValidator(id, "sessionId"))) throw new StoreError("session_not_found", `${JSON.stringify(id)} is not a session ID`)
+  return join(sessionsDir, `${id}.db`)
+}
+
+function sessionIds(sessionsDir: string): SessionId[] {
+  const names = (() => {
+    try {
+      return readdirSync(sessionsDir)
+    } catch {
+      return []
+    }
+  })()
+  return names.flatMap((name) => {
+    const match = SESSION_FILE.exec(name)
+    return match === null ? [] : [match[1] as SessionId]
+  })
+}
+
+function readSessionFile<T>(id: SessionId, options: Parameters<typeof openSqliteStore>[0], work: (store: Store) => T): T {
+  if (!existsSync(options.path)) throw new StoreError("session_not_found", `there is no session ${id}`)
+  const reader = openSqliteStore({ ...options, readOnly: true })
+  try {
+    if (reader.getSession(id) === null) throw new StoreError("session_not_found", `there is no session ${id}`)
+    return work(reader)
+  } finally {
+    reader.close()
+  }
+}
+
+/**
+ * Reads a session's message rows without initializing the directory or holding the writer lock.
+ * Inherited messages are already in a fork's own rows; reading them does not need the parent's file.
+ */
+export function readStoredMessages(dataDir: string, idOrPrefix: string): readonly Message[] {
+  const sessionsDir = join(dataDir, SESSIONS_DIRECTORY)
+  const id = resolveSessionId(sessionIds(sessionsDir), idOrPrefix)
+  return readSessionFile(id, { path: sessionPath(sessionsDir, id) }, (store) => store.readMessages(id))
+}
+
 export function openSessionDirectory(options: SessionDirectoryOptions): SessionDirectory {
   const dataDir = options.dataDir
   const sessionsDir = join(dataDir, SESSIONS_DIRECTORY)
@@ -152,11 +193,7 @@ export function openSessionDirectory(options: SessionDirectoryOptions): SessionD
   const index = new SessionIndex(join(dataDir, INDEX_FILE))
   let closed = false
 
-  const pathOf = (id: SessionId) => {
-    // A session ID becomes a file name: nothing in it may leave the directory.
-    if (!/^[A-Za-z0-9_-]+$/.test(sessionIdValidator(id, "sessionId"))) throw new StoreError("session_not_found", `${JSON.stringify(id)} is not a session ID`)
-    return join(sessionsDir, `${id}.db`)
-  }
+  const pathOf = (id: SessionId) => sessionPath(sessionsDir, id)
 
   const parentLog = (parent: SessionId, range: { readonly afterSeq: number; readonly limit: number }) => {
     try {
@@ -204,15 +241,7 @@ export function openSessionDirectory(options: SessionDirectoryOptions): SessionD
   const read = <T>(id: SessionId, work: (store: Store) => T): T => {
     const writer = held.get(id)
     if (writer !== undefined) return work(writer)
-    const path = pathOf(id)
-    if (!existsSync(path)) throw new StoreError("session_not_found", `there is no session ${id}`)
-    const reader = openSqliteStore({ ...storeOptions(id), readOnly: true })
-    try {
-      if (reader.getSession(id) === null) throw new StoreError("session_not_found", `there is no session ${id}`)
-      return work(reader)
-    } finally {
-      reader.close()
-    }
+    return readSessionFile(id, storeOptions(id), work)
   }
 
   const readEvents: SessionDirectory["readEvents"] = (id, range) => read(id, (store) => store.readEvents(id, range))
@@ -226,19 +255,7 @@ export function openSessionDirectory(options: SessionDirectoryOptions): SessionD
     }
   }
 
-  const ids = (): SessionId[] => {
-    const names = (() => {
-      try {
-        return readdirSync(sessionsDir)
-      } catch {
-        return []
-      }
-    })()
-    return names.flatMap((name) => {
-      const match = SESSION_FILE.exec(name)
-      return match === null ? [] : [match[1] as SessionId]
-    })
-  }
+  const ids = () => sessionIds(sessionsDir)
 
   /** One session's summary straight from its file, or `null` when the file holds no readable session (yet). */
   const summaryFromFile = (id: SessionId): SessionSummary | null => {

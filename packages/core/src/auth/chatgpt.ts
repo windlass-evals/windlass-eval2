@@ -68,8 +68,8 @@ export class AuthError extends Error {
  */
 export const AUTH_UNREACHABLE = "network_error"
 
-export function dataDir() {
-  return join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), brand.directory)
+export function dataDir(env: Readonly<Record<string, string | undefined>> = process.env) {
+  return join(env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), brand.directory)
 }
 
 /**

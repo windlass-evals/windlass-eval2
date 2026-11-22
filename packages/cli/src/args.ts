@@ -46,6 +46,8 @@ export type Parsed =
   | { readonly kind: "fork"; readonly options: ForkOptions }
   /** `replay [<session>] [options]`: the model again on a recorded session, answered from the recording. */
   | { readonly kind: "replay"; readonly options: ReplayOptions }
+  /** `export <session-id>`: the saved conversation as Markdown. */
+  | { readonly kind: "export"; readonly session: string }
   /** A subcommand's own `--help`. */
   | { readonly kind: "usage"; readonly text: string }
   | { readonly kind: "error"; readonly message: string }
@@ -62,6 +64,17 @@ const SHORT: Record<string, string> = { "-h": "--help", "-v": "--version", "-c":
 export function parseArgs(argv: readonly string[]): Parsed {
   if (argv[0] === "acp") return argv.length === 1 ? { kind: "acp" } : error("acp takes no arguments; the client sends everything else")
   if (argv[0] === "login") return { kind: "login", argv: argv.slice(1) }
+  if (argv[0] === "export") {
+    const session = argv[1]
+    if (argv.length === 2 && (session === "--help" || session === "-h"))
+      return { kind: "usage", text: `Usage: ${brand.binary} export <session-id>
+
+Prints the saved conversation as Markdown, with only user and assistant text.
+Use the full session ID or a unique prefix. No sign-in is needed.
+` }
+    if (argv.length !== 2 || session === undefined || session.trim() === "" || session.startsWith("-")) return error("export takes one session ID")
+    return { kind: "export", session }
+  }
   if (argv[0] === "fork" || argv[0] === "replay") {
     const sub = parseSubcommand(argv)
     if (sub.kind === "help") return { kind: "usage", text: sub.text }
@@ -181,6 +194,7 @@ function usageRows(b: string): string {
     [`${b} tui [options]`, [`the full-screen terminal interface (${brand.envPrefix}TUI=1 makes it`, `what \`${b}\` with no prompt starts)`]],
     [`${b} fork [<session>]`, ["a new session with the conversation so far, to try another", "way without changing the original; --turn <n> forks after", `turn n (\`${b} fork --help\`)`]],
     [`${b} replay [<session>]`, ["the model again on a recorded session, every tool call", "answered from the recording: where does a changed prompt,", "tool description or model change what it does", `(\`${b} replay --help\`)`]],
+    [`${b} export <session-id>`, ["print a saved conversation as Markdown (user and assistant text)"]],
   ]
   const width = Math.max(...rows.map(([typed]) => typed.length))
   return rows.flatMap(([typed, lines]) => lines.map((line, index) => `  ${(index === 0 ? typed : "").padEnd(width)}  ${line}`)).join("\n")

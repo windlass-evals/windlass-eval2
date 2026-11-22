@@ -118,8 +118,14 @@ export async function run(io: Io): Promise<number> {
       const { runLogin } = await import("./login.ts")
       return runLogin(parsed.argv, io)
     }
-    case "error":
-      return usage(io, parsed.message, io.argv[0] === "fork" || io.argv[0] === "replay" ? io.argv[0] : null)
+    case "error": {
+      const subcommand = io.argv[0]
+      return usage(io, parsed.message, subcommand === "fork" || subcommand === "replay" || subcommand === "export" ? subcommand : null)
+    }
+    case "export": {
+      const { runExport } = await import("./export.ts")
+      return runExport(io, parsed.session)
+    }
     case "usage":
       io.stdout.write(parsed.text)
       return 0

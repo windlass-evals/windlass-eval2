@@ -139,7 +139,7 @@ windlass --session ses_9acf "and run it"
 
 - `windlass --list-sessions` lists the sessions of the current directory, newest first: ID, last use, model, title.
   Use `--limit <n>` to show only the n most recently updated sessions, and `--since <duration>` to include only
-  sessions updated within that age. Durations are a positive integer followed by `s`, `m`, `h` or `d` (for example,
+  sessions updated within that age. Durations are a positive integer followed by `m`, `h` or `d` (for example,
   `30m`, `6h` or `2d`). The filters can be combined with each other and `--session <id>`; both table output and
   `--json` honor them. A new session first shows the opening line of your prompt. By default, a background request then names it from
   up to 1,000 characters of the text you typed. Attachments, command-file expansions, answers and tool output are

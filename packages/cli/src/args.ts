@@ -124,7 +124,7 @@ export function parseArgs(argv: readonly string[]): Parsed {
   if (sessionLimit !== null && (!Number.isSafeInteger(sessionLimit) || sessionLimit < 1)) return error(`--limit must be a whole number of at least 1; got ${values["--limit"]}`)
   const sessionsSinceMs = values["--since"] === undefined ? null : parseDuration(values["--since"]!)
   if (values["--since"] !== undefined && sessionsSinceMs === null)
-    return error(`--since must be a positive duration in seconds, minutes, hours or days (for example 30m, 6h or 2d); got ${values["--since"]}`)
+    return error(`--since must be a positive duration in minutes, hours or days (for example 30m, 6h or 2d); got ${values["--since"]}`)
   const approval = values["--approval"] ?? null
   if (approval !== null && !(APPROVAL_MODES as readonly string[]).includes(approval)) return error(`--approval must be one of: ${APPROVAL_MODES.join(", ")}`)
   const unattended = values["--unattended"] ?? null
@@ -170,10 +170,10 @@ export function parseArgs(argv: readonly string[]): Parsed {
 }
 
 function parseDuration(value: string): number | null {
-  const match = /^(\d+)(s|m|h|d)$/.exec(value)
+  const match = /^(\d+)(m|h|d)$/.exec(value)
   if (match === null) return null
   const amount = Number(match[1])
-  const unitMs = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 }[match[2] as "s" | "m" | "h" | "d"]
+  const unitMs = { m: 60_000, h: 3_600_000, d: 86_400_000 }[match[2] as "m" | "h" | "d"]
   const duration = amount * unitMs
   return Number.isSafeInteger(duration) && duration > 0 ? duration : null
 }

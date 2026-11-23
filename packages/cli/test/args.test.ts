@@ -70,7 +70,7 @@ describe("parseArgs", () => {
     expect(errorOf(["--since"])).toBe("--since needs a value")
     expect(errorOf(["--list-sessions", "--limit", "-1"])).toBe("--limit needs a value")
     for (const value of ["0", "1.5", "many"]) expect(errorOf(["--list-sessions", "--limit", value])).toContain("--limit must be a whole number of at least 1")
-    for (const value of ["5x", "0m", "1.5h", "999999999999999999d"]) expect(errorOf(["--list-sessions", "--since", value])).toContain("--since must be a positive duration")
+    for (const value of ["5x", "30s", "0m", "1.5h", "999999999999999999d"]) expect(errorOf(["--list-sessions", "--since", value])).toContain("--since must be a positive duration")
     expect(errorOf(["--limit", "1"])).toBe("--limit only applies with --list-sessions")
     expect(errorOf(["--models", "--since", "1h"])).toBe("--since only applies with --list-sessions")
     expect(errorOf(["--json=yes"])).toBe("--json does not take a value")

@@ -15,6 +15,10 @@ export interface Options {
   readonly agent: string | null
   /** `--max-steps <n>`: model calls per turn before the final answer without tools; `null` is the engine's default. */
   readonly maxSteps: number | null
+  /** `--limit <n>`: maximum sessions to list; `null` means no limit. */
+  readonly sessionLimit: number | null
+  /** `--since <duration>` in milliseconds; `null` means no age filter. */
+  readonly sessionsSinceMs: number | null
   /** `--approval <ask|auto|full>`: when a tool call asks before it runs; `null` is the configuration's (default `auto`). */
   readonly approval: "ask" | "auto" | "full" | null
   /** `--unattended <deny|stop>`: what a call that would ask becomes when nobody can answer; `null` is the configuration's (default `deny`). */
@@ -50,7 +54,7 @@ export type Parsed =
   | { readonly kind: "usage"; readonly text: string }
   | { readonly kind: "error"; readonly message: string }
 
-const VALUE_FLAGS = ["--session", "--model", "--effort", "--agent", "--max-steps", "--approval", "--unattended", "--cwd", "--demo", "--demo-speed", "--demo-grace", "--engine"] as const
+const VALUE_FLAGS = ["--session", "--model", "--effort", "--agent", "--max-steps", "--limit", "--since", "--approval", "--unattended", "--cwd", "--demo", "--demo-speed", "--demo-grace", "--engine"] as const
 const APPROVAL_MODES = ["ask", "auto", "full"] as const
 const UNATTENDED_ACTIONS = ["deny", "stop"] as const
 type ValueFlag = (typeof VALUE_FLAGS)[number]
@@ -116,6 +120,11 @@ export function parseArgs(argv: readonly string[]): Parsed {
   if ((values["--demo-speed"] !== undefined || grace !== null) && values["--demo"] === undefined) return error("--demo-speed and --demo-grace only apply with --demo")
   const maxSteps = values["--max-steps"] === undefined ? null : Number(values["--max-steps"])
   if (maxSteps !== null && (!Number.isInteger(maxSteps) || maxSteps < 1)) return error("--max-steps must be a whole number of at least 1")
+  const sessionLimit = values["--limit"] === undefined ? null : Number(values["--limit"])
+  if (sessionLimit !== null && (!Number.isSafeInteger(sessionLimit) || sessionLimit < 1)) return error(`--limit must be a whole number of at least 1; got ${values["--limit"]}`)
+  const sessionsSinceMs = values["--since"] === undefined ? null : parseDuration(values["--since"]!)
+  if (values["--since"] !== undefined && sessionsSinceMs === null)
+    return error(`--since must be a positive duration in minutes, hours or days (for example 30m, 6h or 2d); got ${values["--since"]}`)
   const approval = values["--approval"] ?? null
   if (approval !== null && !(APPROVAL_MODES as readonly string[]).includes(approval)) return error(`--approval must be one of: ${APPROVAL_MODES.join(", ")}`)
   const unattended = values["--unattended"] ?? null
@@ -131,6 +140,10 @@ export function parseArgs(argv: readonly string[]): Parsed {
   if (flags.has("--list-sessions") && flags.has("--models")) return error("--list-sessions and --models cannot be combined")
   if (listing !== null && (words.length > 0 || flags.has("--interactive")))
     return error(`--${listing === "sessions" ? "list-sessions" : "models"} takes no prompt`)
+  if (listing !== "sessions") {
+    if (values["--limit"] !== undefined) return error("--limit only applies with --list-sessions")
+    if (values["--since"] !== undefined) return error("--since only applies with --list-sessions")
+  }
 
   const options: Options = {
     prompt: words.length === 0 ? null : words.join(" "),
@@ -140,6 +153,8 @@ export function parseArgs(argv: readonly string[]): Parsed {
     effort: values["--effort"] ?? null,
     agent: values["--agent"] ?? null,
     maxSteps,
+    sessionLimit,
+    sessionsSinceMs,
     approval: approval as Options["approval"],
     unattended: unattended as Options["unattended"],
     cwd: values["--cwd"] ?? null,
@@ -152,6 +167,15 @@ export function parseArgs(argv: readonly string[]): Parsed {
     engine: engine as EngineKind,
   }
   return listing === null ? { kind: "run", options } : { kind: "list", what: listing, options }
+}
+
+function parseDuration(value: string): number | null {
+  const match = /^(\d+)(m|h|d)$/.exec(value)
+  if (match === null) return null
+  const amount = Number(match[1])
+  const unitMs = { m: 60_000, h: 3_600_000, d: 86_400_000 }[match[2] as "m" | "h" | "d"]
+  const duration = amount * unitMs
+  return Number.isSafeInteger(duration) && duration > 0 ? duration : null
 }
 
 function isValueFlag(name: string): name is ValueFlag {
@@ -222,6 +246,8 @@ Options:
   --show-reasoning       show the model's reasoning instead of a one-line summary
   -i, --interactive      stay interactive after a prompt given as arguments
   --list-sessions        list the sessions in the working directory (--json: one per line)
+  --limit <n>            with --list-sessions, show the n most recently updated sessions
+  --since <duration>     with --list-sessions, show sessions updated within e.g. 30m, 6h or 2d
   --models               list the models --model accepts (--json: one per line)
   -v, --version          print the version
   -h, --help             print this help

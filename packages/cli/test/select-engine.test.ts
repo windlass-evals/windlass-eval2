@@ -56,6 +56,13 @@ describe("--list-sessions and --models", () => {
     expect(result.out.trim().split("\n").map((line) => JSON.parse(line).id)).toEqual(["gpt-test", "gpt-other"])
   })
 
+  test("session filters apply to table and JSON listings alongside --session", async () => {
+    const table = await runCli(["--list-sessions", "--limit", "1", "--since", "365d", "--session", "ses_1"], { realEngineModule: STUB })
+    expect(table.out).toBe("ses_1  2026-11-10 17:30  gpt-other  (untitled)\n")
+    const json = await runCli(["--list-sessions", "--since=365d", "--limit=1", "--session", "ses_2", "--json"], { realEngineModule: STUB })
+    expect(json.out.trim().split("\n").map((line) => JSON.parse(line).id)).toEqual(["ses_2"])
+  })
+
   test("an engine without them says so", async () => {
     const result = await runCli(["--list-sessions"], { realEngineModule: BARE })
     expect(result).toEqual({ code: 1, out: "", err: `${brand.binary}: --list-sessions is not supported by this engine\n` })

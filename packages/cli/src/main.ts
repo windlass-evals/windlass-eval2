@@ -18,6 +18,7 @@ import type { CommandsResult } from "@windlass/acp/extensions"
 import { type CallId, type MessageId, brand, versionLine, versionString } from "@windlass/core"
 import { agentLines, compactText, taskLines, tasksProgress } from "./agents.ts"
 import { helpText, type Options, parseArgs } from "./args.ts"
+import { filterSessions } from "./session-list.ts"
 import { revertable } from "./commands.ts"
 import { type Line, recapLines } from "./features.ts"
 import { type FeatureCommand, type FeatureIo, FeatureWatch, JsonNotices, runFeatureCommand } from "./feature-commands.ts"
@@ -31,6 +32,7 @@ import {
   type EngineEvent,
   EngineUnavailable,
   type Session,
+  type SessionSummary,
   type TurnOutcome,
   endedForApproval,
   exitCodeOf,
@@ -93,6 +95,8 @@ const SUBCOMMAND_DEFAULTS: Options = {
   effort: null,
   agent: null,
   maxSteps: null,
+  sessionLimit: null,
+  sessionsSinceMs: null,
   approval: null,
   unattended: null,
   cwd: null,
@@ -1025,6 +1029,13 @@ async function listing(io: Io, engine: Engine, what: "sessions" | "models", opti
       io.stdout.write(`no session in ${cwd} starts with ${prefix}\n`)
       return 0
     }
+  }
+  if (what === "sessions") {
+    const sessions = filterSessions(
+      table.map(({ row }) => row as SessionSummary),
+      { limit: options.sessionLimit, sinceMs: options.sessionsSinceMs },
+    )
+    table = sessions.map((row) => ({ row, cells: [row.id, localTime(row.updatedAt), row.model, row.title ?? "(untitled)"] }))
   }
   if (options.output === "json") {
     for (const { row } of table) io.stdout.write(`${JSON.stringify(row)}\n`)

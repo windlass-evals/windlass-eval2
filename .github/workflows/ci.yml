@@ -1,10 +1,10 @@
 name: CI
 
-# Pushes to main and pull requests. The release workflow runs the same jobs before it publishes
+# Pushes to main and to the platform's feature branches (windlass/**), and pull requests. The release workflow runs the same jobs before it publishes
 # (workflow_call), with `artifacts: true` so the executables it releases are the ones tested here.
 on:
   push:
-    branches: [main]
+    branches: [main, 'windlass/**']
   pull_request:
   workflow_dispatch:
   workflow_call:

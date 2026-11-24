@@ -382,7 +382,7 @@ describe("approvals and safety, against windlass acp", () => {
     await term.waitFor(READY, { timeoutMs: 20_000 })
     term.type("read the outside notes")
     term.keys("Enter")
-    let frame = await term.waitFor("Read it.", { timeoutMs: 20_000 })
+    let frame = await term.waitFor((next) => next.includes("Read it.") && conversation(next).includes("untrusted content is in the conversation") && conversation(next).includes("/clear-taint when you trust what is there") && next.includes("trust    untrusted · /clear-taint"), { timeoutMs: 20_000 })
     expect(conversation(frame)).toContain("untrusted content is in the conversation")
     expect(conversation(frame)).toContain("/clear-taint when you trust what is there")
     expect(frame).toContain("trust    untrusted · /clear-taint")

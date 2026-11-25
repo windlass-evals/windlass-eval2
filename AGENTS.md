@@ -1,38 +1,47 @@
-# Working in Windlass
+# Working in this repository
 
 ## Setup
-- Use Bun from the repository root. Install workspace dependencies with `bun install`.
-- For the same install mode as CI, use `bun install --frozen-lockfile`.
-- CI pins Bun to 1.4.0; use that version when reproducing a CI result locally.
-- `prefixlens` is a root dev dependency used by the prompt-cache tests; no separate global install is needed.
-- Start with [the architecture overview](docs/architecture.md) and keep [the owner guidance](CLAUDE.md) in view.
+
+- Start at the repository root with Bun 1.4; CI pins 1.4.0.
+- Install workspace dependencies with `bun install`.
+- To reproduce CI dependency resolution, run `bun install --frozen-lockfile` at the root.
+- `prefixlens` is a root development dependency used by prompt-cache tests; no global install is needed.
+- The root workspace includes the packages under `packages/`.
+- No model sign-in is needed for the CI unit or end-to-end suites.
 
 ## Checks by change
-- Run the whole script: it checks both `tsconfig.json` and `evals/tsconfig.json`.
-- For a focused change, use `bun test <path>` with the affected test file or directory.
-- Set `setDefaultTimeout(E2E_TIMEOUT_MS)` in end-to-end files; leave unit tests on Bun's default timeout.
-- For eval grader or runner changes, see [the eval guide](evals/AGENTS.md).
+
+- For TypeScript changes, run `bun run typecheck` from the root: it checks both `tsconfig.json` and `evals/tsconfig.json`.
+- For in-process changes, use `bun run test:unit`: it preloads `test/unit-preload.ts` and excludes `*.e2e.test.ts`.
+- For process-level changes, `bun run test:e2e` selects the `.e2e.test.ts` files.
+- For a focused iteration, pass the changed test path to `bun test` from the root instead of running the whole suite.
+- For durable event changes, update the reducer and the request builder if the model should see the event. Describe the expected behavior in `packages/core/test/scenarios/`, not by editing the reducer test runner or overriding conformance expectations derived from those definitions.
+- When scenario definitions change, regenerate their document section with `bun scripts/scenario-doc.ts --write`.
+- After adding slow end-to-end tests, refresh `test/e2e-timings.json` from the root with `bun run test:e2e --timings=test/e2e-timings.json --update-timings`.
+- For grader changes, run `bun test evals` from the root; graders must reject untouched workspaces and accept reference solutions.
+- Name any test file that starts a process, even indirectly, `*.e2e.test.ts` and set `setDefaultTimeout(E2E_TIMEOUT_MS)`.
 
 ## Leave to CI
-- Use focused local tests rather than repeating the full runner matrix.
-- See the [CI workflow](.github/workflows/ci.yml) for the unit and sharded end-to-end jobs.
-- After adding slow end-to-end tests, refresh `test/e2e-timings.json` using the [Shards step in CONTRIBUTING.md](CONTRIBUTING.md#tests-and-fixtures).
-- Leave cross-platform executable builds and smoke tests to the [CI build job](.github/workflows/ci.yml).
-- Use the stress workflow for repeated end-to-end runs when investigating flakes; ordinary CI does not retry tests.
-- Leave tags and publishing to the maintainer and the Release workflow.
+
+- Leave the full Linux x64, Linux arm64, and macOS unit matrix to [CI](./.github/workflows/ci.yml) after focused local tests.
+- Leave full end-to-end sharding to CI: it runs three shards per runner using `test/e2e-timings.json`.
+- CI provisions Linux bubblewrap for sandbox coverage and adds tmux on macOS for terminal coverage.
+- Use the [stress workflow](./.github/workflows/stress.yml) for repeated end-to-end runs under CPU load, not as a routine local check.
+- Let CI build and smoke-test native release executables on their target platforms.
+- Leave version tags and publishing to the maintainer and the [release workflow](./.github/workflows/release.yml); see [releasing](./docs/releasing.md).
+- Expect CI hygiene checks to catch tracked session data, traces, and credential-like files or content; keep them out of the change.
 
 ## Handoff
-- Report which targeted commands actually ran and which checks remain for CI.
-- Coordinate changes to the event schema, reducer, request builder, and engine rather than editing them in parallel.
-- For a durable-event change, update the reducer, and update the request builder if the model should see the event.
-- Update the step-loop scenarios with the event change and regenerate the scenario document with `bun scripts/scenario-doc.ts --write`.
-- **Fixtures are synthetic and hand-written.** Never commit real session data, traces or credentials.
-- For user-visible changes, use the existing headless or tmux testing procedure as appropriate.
-- Keep commits one line, conventional style, with no co-author lines.
-- **Stored text is never re-rendered.** Tool output is capped once when produced and replayed byte for byte.
-- **No third-party CLIs, global installs or sudo** in scripts or tests.
-- **`packages/core` has no runtime dependencies.**
-- Keep new features in standalone modules with tests and a README explaining how the engine uses the module.
+
+- Start with the [architecture](./docs/architecture.md) and keep the owner rules in [CLAUDE.md](./CLAUDE.md) in view.
+- Use synthetic, hand-written fixtures; never include real sessions, traces, or credentials.
+- If committing, use a one-line conventional commit message with no co-author lines.
+- For user-visible headless changes, use the [harness testing procedure](./.claude/skills/harness-testing/SKILL.md).
+- For user-visible full-screen changes, use the [tmux testing procedure](./.claude/skills/tui-tmux-testing/SKILL.md).
+- Report the focused tests run separately from the CI matrix coverage still to come.
 
 ## Terms
-- **Request prefix:** the portion of the model request that must remain stable as new messages append, apart from allowed breaks.
+
+- **Projection:** state derived by folding durable events through the reducer.
+- **Baseline:** the stored instructions and frozen tool list copied into a model request in stored order.
+- **Prefix break:** a model request that does not extend its predecessor; permitted at compaction, revert, refusal, or settings change.

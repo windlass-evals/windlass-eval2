@@ -42,6 +42,24 @@ describe("exit codes", () => {
     }
   })
 
+  test("an empty model is a usage error before selecting an engine", async () => {
+    for (const argv of [["--model", "", "hello"], ["-m", "", "hello"], ["--model=", "hello"]]) {
+      let engineSelected = false
+      const result = await runCli(argv, {
+        engine: () => {
+          engineSelected = true
+          throw new Error("an empty model must not select an engine")
+        },
+      })
+      expect(result).toEqual({
+        code: 2,
+        out: "",
+        err: `${brand.binary}: --model needs a model name\nRun \`${brand.binary} --help\` for usage.\n`,
+      })
+      expect(engineSelected).toBe(false)
+    }
+  })
+
   test("the process exits with the turn's code", async () => {
     for (const [name, code] of [["a-plain-answer", 0], ["a-non-retryable-error-usage-limit", 1], ["cancel-while-one-tool-is-running", 130]] as const) {
       const proc = Bun.spawn(["bun", CLI, ...demo(name)], { stdout: "pipe", stderr: "pipe", stdin: "ignore" })

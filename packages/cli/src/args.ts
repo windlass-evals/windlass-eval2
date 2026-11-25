@@ -93,7 +93,7 @@ export function parseArgs(argv: readonly string[]): Parsed {
       const value = inline ?? argv[index + 1]
       if (inline === null) index += 1
       if (value === undefined || (inline === null && value.startsWith("-") && value !== "-")) return error(`${name} needs a value`)
-      if (value === "") return error(`${name} needs a non-empty value`)
+      if (value === "") return error(name === "--model" ? "--model needs a model name" : `${name} needs a non-empty value`)
       values[name] = value
       continue
     }

@@ -47,6 +47,13 @@ describe("parseArgs", () => {
     expect(options(["--demo", "3", "--demo-speed", "2.5", "--demo-grace", "5000"])).toMatchObject({ demo: "3", demoSpeed: 2.5, demoGraceMs: 5000 })
   })
 
+  test("--model needs a model name, including its short and inline forms", () => {
+    for (const argv of [["--model", "", "hello"], ["-m", "", "hello"], ["--model=", "hello"]])
+      expect(errorOf(argv)).toBe("--model needs a model name")
+    for (const argv of [["--model", "gpt-6.1-sol", "hello"], ["-m", "gpt-6.1-sol", "hello"], ["--model=gpt-6.1-sol", "hello"]])
+      expect(options(argv)).toMatchObject({ model: "gpt-6.1-sol", prompt: "hello" })
+  })
+
   test("help and version win over everything else", () => {
     expect(parseArgs(["--json", "-h"]).kind).toBe("help")
     expect(parseArgs(["prompt", "--version"]).kind).toBe("version")
@@ -63,7 +70,8 @@ describe("parseArgs", () => {
     expect(parseArgs(["fork", "--thruogh", "3"])).toEqual({ kind: "error", message: "fork: unknown option --thruogh; did you mean --through?" })
     expect(errorOf(["--model"])).toBe("--model needs a value")
     expect(errorOf(["--model", "--json"])).toBe("--model needs a value")
-    expect(errorOf(["--model="])).toBe("--model needs a non-empty value")
+    expect(errorOf(["--model="])).toBe("--model needs a model name")
+    expect(errorOf(["--session", ""])).toBe("--session needs a non-empty value")
     expect(errorOf(["--json=yes"])).toBe("--json does not take a value")
     expect(errorOf(["--json", "--quiet"])).toBe("--json and --quiet cannot be combined")
     expect(errorOf(["--session", "s", "--continue"])).toBe("--session and --continue cannot be combined")

@@ -125,6 +125,43 @@ handed-in token instead; `login token` refuses, since such a process holds no si
 The file is treated as the sign-in it stands for: a sandboxed command cannot read it, a tool that reads it asks
 first, and every token read from it is redacted from tool output, the one in the file at that moment included.
 
+## First steps
+
+**Try it without signing in.** The demos are scripted sessions, so no model is called:
+
+```sh
+windlass --demo list
+windlass --demo find-and-fix-a-failing-test
+```
+
+**Work in a project.** In the project's folder, open the full-screen interface:
+
+```sh
+windlass tui
+```
+
+Type what you want changed and press Enter. The agent reads, edits and runs commands while you watch; the panel on
+the right shows the session, the tokens used and how much of each request came from the prompt cache.
+
+- Type while it works to steer it; `/queue <message>` holds a message until the turn ends instead.
+- `/diff` shows what the last turn changed, `/review` lets you comment on its lines, `/undo` and `/redo` take it
+  back or put it back.
+- `/help` lists every key and command. Ctrl-C stops the agent; pressed twice it leaves.
+
+![Reviewing a turn's changes, with a comment on one line for the agent](images/review.png)
+
+`windlass` on its own gives the same in a plain line interface, and `windlass -c` resumes the most recent session
+in the folder. For a single task that runs to the end without you:
+
+```sh
+windlass "the add test fails; find out why and fix it"
+```
+
+It prints each tool call as it runs and ends with a line such as `✓ done · no checks configured · 6 steps · 16s`.
+
+**Choosing a model.** The default is `gpt-6.1-sol`. For quick, cheap tasks use `--model gpt-6-luna --effort low`;
+`/model` switches during a session ([Models and effort](#models-and-effort)).
+
 ## Sessions
 
 Every conversation is a session, kept on disk until you delete it. A session belongs to the directory it was

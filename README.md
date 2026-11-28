@@ -49,8 +49,7 @@ Then sign in with your ChatGPT plan:
 windlass login
 ```
 
-It opens a browser, or on a remote machine prints an address to open anywhere
-([how](docs/user-guide.md#signing-in)).
+It opens a browser, or on a remote machine prints an address to open anywhere ([how](docs/user-guide.md#signing-in)).
 
 ## Quickstart
 

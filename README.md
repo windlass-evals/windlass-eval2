@@ -89,6 +89,8 @@ It prints each tool call as it runs and ends with a line such as `✓ done · no
 **Choosing a model.** The default is `gpt-6.1-sol`. For quick, cheap tasks use `--model gpt-6-luna --effort low`;
 `/model` switches during a session.
 
+**Filing work from Slack.** You should see “Work item filed” in a thread, then “Pull request opened”.
+
 ## Limits
 
 - **Linux on arm64 is where it is used.** Executables for Linux x64 and macOS can be built but are untested, and

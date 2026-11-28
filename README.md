@@ -49,8 +49,7 @@ Then sign in with your ChatGPT plan:
 windlass login
 ```
 
-It opens a browser, or on a remote machine prints an address to open anywhere
-([how](docs/user-guide.md#signing-in)).
+It opens a browser, or on a remote machine prints an address to open anywhere ([how](docs/user-guide.md#signing-in)).
 
 ## Quickstart
 
@@ -88,6 +87,8 @@ It prints each tool call as it runs and ends with a line such as `✓ done · no
 
 **Choosing a model.** The default is `gpt-6.1-sol`. For quick, cheap tasks use `--model gpt-6-luna --effort low`;
 `/model` switches during a session.
+
+**Filing work from Slack.** You should see “Work item filed” in a thread, then “Pull request opened”.
 
 ## Limits
 
